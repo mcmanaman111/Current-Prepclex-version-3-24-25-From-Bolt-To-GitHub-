@@ -1,0 +1,7 @@
+tasks:
+  generate_schema:
+    prompt: src/prompts/generate_schema.md
+    input_files:
+      - schema_export.json
+    output_files:
+      - docs/db_schema.md

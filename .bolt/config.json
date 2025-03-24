@@ -1,0 +1,8 @@
+{
+  "prompts": {
+    "base": ".bolt/prompts/base.md",
+    "tasks": {
+      "generate_schema": ".bolt/prompts/tasks/generate_schema.md"
+    }
+  }
+}

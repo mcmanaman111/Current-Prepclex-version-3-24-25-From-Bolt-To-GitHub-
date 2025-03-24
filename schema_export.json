@@ -1,0 +1,3453 @@
+[
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "calculate_question_type_distribution",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- Calculate distribution from test_results and questions tables\n  WITH question_stats AS (\n    SELECT \n      q.question_type,\n      COUNT(*) as total,\n      COUNT(CASE WHEN tr.is_correct THEN 1 END) as correct\n    FROM test_results tr\n    JOIN questions q ON q.id = tr.question_id\n    WHERE tr.test_id = NEW.test_id\n    GROUP BY q.question_type\n  )\n  UPDATE test_statistics\n  SET question_type_distribution = (\n    SELECT jsonb_object_agg(\n      question_type,\n      jsonb_build_object(\n        'total', total,\n        'correct', correct\n      )\n    )\n    FROM question_stats\n  )\n  WHERE test_statistics.id = NEW.id;\n\n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "calculate_user_readiness",
+    "data_type": "TABLE(readiness_score numeric, readiness_level text, weak_areas jsonb, strong_areas jsonb, recommended_topics jsonb)",
+    "column_description": "\nDECLARE\n  total_topics INTEGER;\n  mastered_topics INTEGER;\n  recent_test_avg NUMERIC;\n  study_consistency NUMERIC;\nBEGIN\n  -- Get total number of topics\n  SELECT COUNT(*) INTO total_topics FROM topics;\n  \n  -- Get number of mastered topics\n  SELECT COUNT(*) INTO mastered_topics\n  FROM user_topic_mastery\n  WHERE user_id = user_uuid AND mastery_level = 'mastered';\n  \n  -- Get recent test average\n  SELECT AVG(overall_score) INTO recent_test_avg\n  FROM test_statistics\n  WHERE user_id = user_uuid\n  AND created_at >= NOW() - INTERVAL '30 days';\n  \n  -- Calculate study consistency (0-100)\n  SELECT \n    CASE \n      WHEN current_streak_days >= 30 THEN 100\n      ELSE (current_streak_days::numeric / 30) * 100\n    END INTO study_consistency\n  FROM user_progress\n  WHERE user_id = user_uuid;\n\n  RETURN QUERY\n  WITH topic_stats AS (\n    SELECT \n      t.id as topic_id,\n      t.name as topic_name,\n      COALESCE(AVG(tp.score_percentage), 0) as avg_score,\n      COUNT(DISTINCT tp.test_id) as attempts,\n      utm.mastery_level\n    FROM topics t\n    LEFT JOIN topic_performance tp ON tp.topic_id = t.id AND tp.user_id = user_uuid\n    LEFT JOIN user_topic_mastery utm ON utm.topic_id = t.id AND utm.user_id = user_uuid\n    GROUP BY t.id, t.name, utm.mastery_level\n  )\n  SELECT\n    -- Calculate readiness score (0-100)\n    ROUND(\n      (COALESCE(recent_test_avg, 0) * 0.4) +\n      ((mastered_topics::numeric / NULLIF(total_topics, 0)) * 100 * 0.3) +\n      (COALESCE(study_consistency, 0) * 0.3)\n    , 2),\n    \n    -- Determine readiness level\n    CASE\n      WHEN recent_test_avg >= 80 AND (mastered_topics::numeric / total_topics) >= 0.8 \n        AND study_consistency >= 80 THEN 'High Readiness'\n      WHEN recent_test_avg >= 70 AND (mastered_topics::numeric / total_topics) >= 0.6 \n        AND study_consistency >= 60 THEN 'Moderate Readiness'\n      ELSE 'Additional Preparation Needed'\n    END,\n    \n    -- Identify weak areas\n    (\n      SELECT jsonb_agg(jsonb_build_object(\n        'topic', topic_name,\n        'score', avg_score,\n        'attempts', attempts\n      ))\n      FROM topic_stats\n      WHERE avg_score < 70\n      ORDER BY avg_score\n      LIMIT 5\n    ),\n    \n    -- Identify strong areas\n    (\n      SELECT jsonb_agg(jsonb_build_object(\n        'topic', topic_name,\n        'score', avg_score,\n        'mastery_level', mastery_level\n      ))\n      FROM topic_stats\n      WHERE avg_score >= 80\n      ORDER BY avg_score DESC\n      LIMIT 5\n    ),\n    \n    -- Generate topic recommendations\n    (\n      SELECT jsonb_agg(jsonb_build_object(\n        'topic', topic_name,\n        'current_score', avg_score,\n        'priority', \n        CASE\n          WHEN avg_score < 60 THEN 'High'\n          WHEN avg_score < 75 THEN 'Medium'\n          ELSE 'Low'\n        END\n      ))\n      FROM topic_stats\n      WHERE avg_score < 80\n      ORDER BY avg_score\n      LIMIT 5\n    );\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "delete_user",
+    "data_type": "boolean",
+    "column_description": "\nDECLARE\n  calling_user_email text;\nBEGIN\n  -- Get the email of the calling user\n  SELECT email INTO calling_user_email\n  FROM auth.users\n  WHERE id = auth.uid();\n\n  -- Check if calling user is an admin\n  IF NOT (calling_user_email LIKE '%@prepclex.com' OR calling_user_email = 'mcmanaman111@gmail.com') THEN\n    RAISE EXCEPTION 'Only administrators can delete users';\n  END IF;\n\n  -- Delete from auth.users (will cascade to public.users)\n  DELETE FROM auth.users WHERE id = user_id;\n\n  RETURN true;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_available_questions",
+    "data_type": "TABLE(question_id integer, status character varying, topic_id integer, subtopic_id integer, is_ngn boolean, attempts integer, success_rate numeric)",
+    "column_description": "\nBEGIN\n  RETURN QUERY\n  SELECT \n    q.id as question_id,\n    COALESCE(qs.status, 'unused') as status,\n    q.topic_id,\n    q.sub_topic_id as subtopic_id,\n    q.ngn as is_ngn,\n    COALESCE(qs.attempts_count, 0) as attempts,\n    CASE \n      WHEN COALESCE(qs.attempts_count, 0) = 0 THEN 0\n      ELSE ROUND((qs.correct_count::numeric / qs.attempts_count) * 100, 2)\n    END as success_rate\n  FROM questions q\n  LEFT JOIN question_status qs ON \n    qs.question_id = q.id AND \n    qs.user_id = p_user_id\n  WHERE \n    (p_statuses IS NULL OR COALESCE(qs.status, 'unused') = ANY(p_statuses)) AND\n    (p_topics IS NULL OR q.topic_id = ANY(p_topics)) AND\n    (p_subtopics IS NULL OR q.sub_topic_id = ANY(p_subtopics)) AND\n    (NOT p_ngn_only OR q.ngn = true);\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_learning_progress",
+    "data_type": "TABLE(time_period date, questions_completed integer, average_score numeric, study_time_minutes integer, topics_improved integer, mastery_gained integer, ngn_performance jsonb, weak_areas jsonb, strong_areas jsonb)",
+    "column_description": "\nBEGIN\n  -- Check permissions\n  IF NOT EXISTS (\n    SELECT 1 FROM profiles \n    WHERE id = user_uuid \n    AND (id = auth.uid() OR EXISTS (\n      SELECT 1 FROM profiles \n      WHERE id = auth.uid() \n      AND role_id = 1\n    ))\n  ) THEN\n    RAISE EXCEPTION 'Not authorized';\n  END IF;\n\n  RETURN QUERY\n  WITH daily_stats AS (\n    SELECT \n      DATE_TRUNC('day', ts.created_at)::date as study_date,\n      COUNT(tr.id) as questions_completed,\n      AVG(tr.score) as daily_score,\n      SUM(tr.time_spent_seconds) / 60 as study_minutes,\n      COUNT(DISTINCT tp.topic_id) as topics_studied,\n      COUNT(DISTINCT CASE \n        WHEN tp.score_percentage >= 80 THEN tp.topic_id \n      END) as topics_mastered,\n      jsonb_build_object(\n        'total', COUNT(CASE WHEN q.ngn THEN 1 END),\n        'correct', COUNT(CASE WHEN q.ngn AND tr.is_correct THEN 1 END)\n      ) as ngn_stats,\n      (\n        SELECT jsonb_agg(jsonb_build_object(\n          'topic', t.name,\n          'score', AVG(tp2.score_percentage)\n        ))\n        FROM topic_performance tp2\n        JOIN topics t ON t.id = tp2.topic_id\n        WHERE tp2.user_id = user_uuid\n        AND tp2.created_at::date = DATE_TRUNC('day', ts.created_at)::date\n        AND tp2.score_percentage < 70\n        GROUP BY t.id, t.name\n        ORDER BY AVG(tp2.score_percentage)\n        LIMIT 3\n      ) as weak_topics,\n      (\n        SELECT jsonb_agg(jsonb_build_object(\n          'topic', t.name,\n          'score', AVG(tp2.score_percentage)\n        ))\n        FROM topic_performance tp2\n        JOIN topics t ON t.id = tp2.topic_id\n        WHERE tp2.user_id = user_uuid\n        AND tp2.created_at::date = DATE_TRUNC('day', ts.created_at)::date\n        AND tp2.score_percentage >= 80\n        GROUP BY t.id, t.name\n        ORDER BY AVG(tp2.score_percentage) DESC\n        LIMIT 3\n      ) as strong_topics\n    FROM test_statistics ts\n    JOIN test_results tr ON tr.test_id = ts.test_id\n    JOIN questions q ON q.id = tr.question_id\n    LEFT JOIN topic_performance tp ON tp.test_id = ts.test_id\n    WHERE ts.user_id = user_uuid\n    AND ts.created_at >= NOW() - INTERVAL '30 days'\n    GROUP BY DATE_TRUNC('day', ts.created_at)::date\n  )\n  SELECT \n    ds.study_date as time_period,\n    ds.questions_completed,\n    ROUND(ds.daily_score, 2) as average_score,\n    ds.study_minutes as study_time_minutes,\n    ds.topics_studied as topics_improved,\n    ds.topics_mastered as mastery_gained,\n    ds.ngn_stats as ngn_performance,\n    ds.weak_topics as weak_areas,\n    ds.strong_topics as strong_areas\n  FROM daily_stats ds\n  ORDER BY ds.study_date DESC;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_or_create_topic_ids",
+    "data_type": "TABLE(topic_id integer, subtopic_id integer)",
+    "column_description": "\nDECLARE\n  v_topic_id INTEGER;\n  v_subtopic_id INTEGER;\nBEGIN\n  -- Get or create topic\n  SELECT id INTO v_topic_id\n  FROM topics\n  WHERE name = p_topic_name;\n  \n  IF v_topic_id IS NULL THEN\n    INSERT INTO topics (name)\n    VALUES (p_topic_name)\n    RETURNING id INTO v_topic_id;\n  END IF;\n\n  -- Get or create subtopic\n  SELECT id INTO v_subtopic_id\n  FROM subtopics\n  WHERE topic_id = v_topic_id AND name = p_subtopic_name;\n  \n  IF v_subtopic_id IS NULL THEN\n    INSERT INTO subtopics (topic_id, name)\n    VALUES (v_topic_id, p_subtopic_name)\n    RETURNING id INTO v_subtopic_id;\n  END IF;\n\n  RETURN QUERY SELECT v_topic_id, v_subtopic_id;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_question_performance",
+    "data_type": "TABLE(total_attempts integer, correct_attempts integer, average_time_seconds numeric, peer_success_rate numeric, topic_mastery_level character varying, common_mistakes jsonb, time_trend jsonb, related_topics_performance jsonb)",
+    "column_description": "\nBEGIN\n  -- Check permissions\n  IF NOT EXISTS (\n    SELECT 1 FROM profiles \n    WHERE id = user_uuid \n    AND (id = auth.uid() OR EXISTS (\n      SELECT 1 FROM profiles \n      WHERE id = auth.uid() \n      AND role_id = 1\n    ))\n  ) THEN\n    RAISE EXCEPTION 'Not authorized';\n  END IF;\n\n  RETURN QUERY\n  WITH question_attempts AS (\n    SELECT \n      tr.is_correct,\n      tr.time_spent_seconds,\n      tr.created_at,\n      q.topic_id,\n      q.sub_topic_id\n    FROM test_results tr\n    JOIN questions q ON q.id = tr.question_id\n    WHERE tr.question_id = question_uuid\n    AND tr.user_id = user_uuid\n  )\n  SELECT \n    COUNT(*) as total_attempts,\n    COUNT(CASE WHEN is_correct THEN 1 END) as correct_attempts,\n    AVG(time_spent_seconds) as average_time_seconds,\n    (\n      SELECT ROUND(AVG(CASE WHEN tr.is_correct THEN 100.0 ELSE 0.0 END), 2)\n      FROM test_results tr\n      WHERE tr.question_id = question_uuid\n    ) as peer_success_rate,\n    (\n      SELECT mastery_level\n      FROM user_topic_mastery utm\n      WHERE utm.user_id = user_uuid\n      AND utm.topic_id = (SELECT topic_id FROM questions WHERE id = question_uuid)\n      LIMIT 1\n    ) as topic_mastery_level,\n    (\n      SELECT jsonb_build_object(\n        'incorrect_answers', COUNT(CASE WHEN NOT is_correct THEN 1 END),\n        'partial_correct', COUNT(CASE WHEN is_partially_correct THEN 1 END),\n        'time_exceeded', COUNT(CASE WHEN time_spent_seconds > 120 THEN 1 END)\n      )\n    ) as common_mistakes,\n    (\n      SELECT jsonb_agg(\n        jsonb_build_object(\n          'attempt_number', ROW_NUMBER() OVER (ORDER BY created_at),\n          'time_spent', time_spent_seconds,\n          'is_correct', is_correct\n        )\n      )\n      FROM question_attempts\n    ) as time_trend,\n    (\n      SELECT jsonb_object_agg(\n        t.name,\n        jsonb_build_object(\n          'score', tp.score_percentage,\n          'mastery', utm.mastery_level\n        )\n      )\n      FROM topics t\n      JOIN topic_performance tp ON tp.topic_id = t.id\n      LEFT JOIN user_topic_mastery utm ON utm.topic_id = t.id AND utm.user_id = user_uuid\n      WHERE t.id IN (\n        SELECT DISTINCT topic_id \n        FROM questions \n        WHERE id = question_uuid \n        OR sub_topic_id IN (\n          SELECT sub_topic_id \n          FROM questions \n          WHERE id = question_uuid\n        )\n      )\n    ) as related_topics_performance\n  FROM question_attempts;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_test_performance",
+    "data_type": "TABLE(topic_id integer, topic_name character varying, subtopic_id integer, subtopic_name character varying, total_questions integer, correct_answers integer, incorrect_answers integer, score_percentage numeric, ngn_questions integer, question_type_stats jsonb, average_time_seconds numeric, mastery_impact text)",
+    "column_description": "\nBEGIN\n  -- Check permissions\n  IF NOT EXISTS (\n    SELECT 1 FROM tests \n    WHERE id = test_uuid \n    AND (user_id = user_uuid OR EXISTS (\n      SELECT 1 FROM profiles \n      WHERE id = auth.uid() \n      AND role_id = 1\n    ))\n  ) THEN\n    RAISE EXCEPTION 'Not authorized';\n  END IF;\n\n  RETURN QUERY\n  SELECT \n    tp.topic_id,\n    t.name as topic_name,\n    tp.subtopic_id,\n    st.name as subtopic_name,\n    tp.total_questions,\n    tp.correct_answers,\n    tp.incorrect_answers,\n    tp.score_percentage,\n    tp.ngn_questions,\n    tp.question_type_breakdown as question_type_stats,\n    AVG(tr.time_spent_seconds) as average_time_seconds,\n    CASE \n      WHEN tp.score_percentage >= 80 THEN 'Mastery Achieved'\n      WHEN tp.score_percentage >= 70 THEN 'Approaching Mastery'\n      ELSE 'Needs Review'\n    END as mastery_impact\n  FROM topic_performance tp\n  JOIN topics t ON t.id = tp.topic_id\n  LEFT JOIN subtopics st ON st.id = tp.subtopic_id\n  LEFT JOIN test_results tr ON tr.test_id = tp.test_id\n  WHERE tp.test_id = test_uuid\n  GROUP BY \n    tp.topic_id, \n    t.name,\n    tp.subtopic_id,\n    st.name,\n    tp.total_questions,\n    tp.correct_answers,\n    tp.incorrect_answers,\n    tp.score_percentage,\n    tp.ngn_questions,\n    tp.question_type_breakdown;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_test_results",
+    "data_type": "TABLE(question_id integer, question_order integer, question_text text, question_type character varying, topic character varying, sub_topic character varying, is_ngn boolean, difficulty character varying, is_correct boolean, is_partially_correct boolean, score numeric, time_spent_seconds integer, is_marked boolean, has_notes boolean, notes text[], explanation text)",
+    "column_description": "\nBEGIN\n  -- Check if user has permission to view this test\n  IF NOT EXISTS (\n    SELECT 1 FROM tests \n    WHERE id = test_uuid \n    AND (user_id = user_uuid OR EXISTS (\n      SELECT 1 FROM profiles \n      WHERE id = auth.uid() \n      AND role_id = 1\n    ))\n  ) THEN\n    RAISE EXCEPTION 'Not authorized';\n  END IF;\n\n  RETURN QUERY\n  SELECT \n    q.id as question_id,\n    tr.question_order,\n    q.question_text,\n    q.question_type,\n    q.topic,\n    q.sub_topic,\n    q.ngn as is_ngn,\n    q.difficulty,\n    tr.is_correct,\n    tr.is_partially_correct,\n    tr.score,\n    tr.time_spent_seconds,\n    tr.is_marked,\n    tr.has_notes,\n    ARRAY(\n      SELECT n.content \n      FROM notes n \n      WHERE n.question_id = q.id::text \n      AND n.test_id = test_uuid::text\n    ) as notes,\n    q.explanation\n  FROM test_results tr\n  JOIN questions q ON q.id = tr.question_id\n  WHERE tr.test_id = test_uuid\n  ORDER BY tr.question_order;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_test_statistics",
+    "data_type": "TABLE(total_questions integer, correct_answers integer, partially_correct integer, incorrect_answers integer, overall_score numeric, average_time_per_question numeric, total_time_minutes integer, ngn_questions_count integer, ngn_success_rate numeric, question_type_distribution jsonb, topic_coverage_percentage numeric, mastery_impact_score numeric)",
+    "column_description": "\nBEGIN\n  -- Check permissions\n  IF NOT EXISTS (\n    SELECT 1 FROM tests \n    WHERE id = test_uuid \n    AND (user_id = user_uuid OR EXISTS (\n      SELECT 1 FROM profiles \n      WHERE id = auth.uid() \n      AND role_id = 1\n    ))\n  ) THEN\n    RAISE EXCEPTION 'Not authorized';\n  END IF;\n\n  RETURN QUERY\n  SELECT \n    ts.total_questions,\n    ts.correct_answers,\n    ts.partially_correct,\n    ts.incorrect_answers,\n    ts.overall_score,\n    ts.average_time_per_question,\n    t.total_time_seconds / 60 as total_time_minutes,\n    COUNT(CASE WHEN q.ngn THEN 1 END) as ngn_questions_count,\n    ROUND(\n      (COUNT(CASE WHEN q.ngn AND tr.is_correct THEN 1 END)::numeric / \n      NULLIF(COUNT(CASE WHEN q.ngn THEN 1 END), 0) * 100), \n      2\n    ) as ngn_success_rate,\n    ts.question_type_distribution,\n    ROUND(\n      (COUNT(DISTINCT tp.topic_id)::numeric / \n      (SELECT COUNT(*) FROM topics) * 100),\n      2\n    ) as topic_coverage_percentage,\n    ROUND(\n      (ts.overall_score * 0.7 + \n      (COUNT(CASE WHEN tp.score_percentage >= 80 THEN 1 END)::numeric / \n      NULLIF(COUNT(DISTINCT tp.topic_id), 0) * 100) * 0.3),\n      2\n    ) as mastery_impact_score\n  FROM test_statistics ts\n  JOIN tests t ON t.id = ts.test_id\n  JOIN test_results tr ON tr.test_id = ts.test_id\n  JOIN questions q ON q.id = tr.question_id\n  LEFT JOIN topic_performance tp ON tp.test_id = ts.test_id\n  WHERE ts.test_id = test_uuid\n  GROUP BY \n    ts.total_questions,\n    ts.correct_answers,\n    ts.partially_correct,\n    ts.incorrect_answers,\n    ts.overall_score,\n    ts.average_time_per_question,\n    t.total_time_seconds,\n    ts.question_type_distribution;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "get_user_performance",
+    "data_type": "TABLE(user_id uuid, total_tests_taken integer, total_questions_completed integer, total_study_time_minutes integer, current_streak_days integer, overall_average_score numeric, last_activity_date date, topics_attempted bigint, avg_topic_score numeric, mastered_topics bigint, overall_accuracy numeric, total_ngn_questions bigint, total_topics_with_mastery bigint, mastered_topics_count bigint, proficient_topics_count bigint, mastery_percentage numeric, recent_test_avg numeric, recent_tests_count bigint, readiness_level text, created_at timestamp with time zone, updated_at timestamp with time zone)",
+    "column_description": "\nBEGIN\n  -- Check if user has permission to view this data\n  IF user_uuid != auth.uid() AND NOT EXISTS (\n    SELECT 1 FROM profiles \n    WHERE id = auth.uid() \n    AND role_id = 1\n  ) THEN\n    RAISE EXCEPTION 'Not authorized';\n  END IF;\n\n  RETURN QUERY\n  WITH topic_stats AS (\n    SELECT \n      tp.user_id,\n      COUNT(DISTINCT tp.topic_id) as topics_attempted,\n      AVG(tp.score_percentage) as avg_topic_score,\n      COUNT(DISTINCT CASE WHEN tp.score_percentage >= 80 THEN tp.topic_id END) as mastered_topics,\n      SUM(tp.total_questions) as total_topic_questions,\n      SUM(tp.correct_answers) as total_topic_correct,\n      SUM(tp.incorrect_answers) as total_topic_incorrect,\n      SUM(tp.ngn_questions) as total_ngn_questions\n    FROM topic_performance tp\n    WHERE tp.user_id = user_uuid\n    GROUP BY tp.user_id\n  ),\n  mastery_stats AS (\n    SELECT \n      utm.user_id,\n      COUNT(DISTINCT utm.topic_id) as total_topics_with_mastery,\n      COUNT(DISTINCT CASE \n        WHEN utm.mastery_level = 'mastered' THEN utm.topic_id \n      END) as mastered_topics_count,\n      COUNT(DISTINCT CASE \n        WHEN utm.mastery_level = 'proficient' THEN utm.topic_id \n      END) as proficient_topics_count\n    FROM user_topic_mastery utm\n    WHERE utm.user_id = user_uuid\n    GROUP BY utm.user_id\n  ),\n  test_trends AS (\n    SELECT \n      ts.user_id,\n      AVG(ts.overall_score) as recent_test_avg,\n      COUNT(*) as recent_tests_count\n    FROM test_statistics ts\n    WHERE ts.user_id = user_uuid\n    AND ts.created_at >= NOW() - INTERVAL '30 days'\n    GROUP BY ts.user_id\n  )\n  SELECT \n    up.user_id,\n    up.total_tests_taken,\n    up.total_questions_completed,\n    up.total_study_time_minutes,\n    up.current_streak_days,\n    up.average_score as overall_average_score,\n    up.last_activity_date,\n    \n    -- Topic performance metrics\n    ts.topics_attempted,\n    ts.avg_topic_score,\n    ts.mastered_topics,\n    ROUND((ts.total_topic_correct::numeric / NULLIF(ts.total_topic_questions, 0) * 100), 2) as overall_accuracy,\n    ts.total_ngn_questions,\n    \n    -- Mastery metrics\n    ms.total_topics_with_mastery,\n    ms.mastered_topics_count,\n    ms.proficient_topics_count,\n    ROUND((ms.mastered_topics_count::numeric / NULLIF(ms.total_topics_with_mastery, 0) * 100), 2) as mastery_percentage,\n    \n    -- Recent performance trends\n    tt.recent_test_avg,\n    tt.recent_tests_count,\n    \n    -- Calculated fields\n    CASE \n      WHEN ts.avg_topic_score >= 80 AND ms.mastered_topics_count >= 5 THEN 'High'\n      WHEN ts.avg_topic_score >= 70 AND ms.mastered_topics_count >= 3 THEN 'Moderate'\n      ELSE 'Needs Improvement'\n    END as readiness_level,\n    \n    -- Timestamps\n    up.created_at,\n    up.updated_at\n  FROM user_progress up\n  LEFT JOIN topic_stats ts ON up.user_id = ts.user_id\n  LEFT JOIN mastery_stats ms ON up.user_id = ms.user_id\n  LEFT JOIN test_trends tt ON up.user_id = tt.user_id\n  WHERE up.user_id = user_uuid;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "handle_feedback_response",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- Only proceed if admin_response was updated\n  IF NEW.admin_response IS NOT NULL AND \n     (OLD.admin_response IS NULL OR NEW.admin_response != OLD.admin_response) THEN\n    \n    -- Create notification for user\n    INSERT INTO notifications (\n      user_id,\n      type,\n      title,\n      message,\n      link\n    ) VALUES (\n      NEW.user_id::text,\n      'feedback_response',\n      'Response to Your Feedback',\n      'An administrator has responded to your feedback on question ' || NEW.question_id,\n      '/exam?question=' || NEW.question_id\n    );\n    \n    -- Update feedback status\n    NEW.status := 'responded';\n  END IF;\n  \n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "handle_new_feedback",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- Create notification for admin\n  INSERT INTO notifications (\n    user_id,\n    type,\n    title,\n    message,\n    link\n  ) VALUES (\n    'admin',\n    'question_feedback',\n    'New Question Feedback',\n    'New feedback received for question ' || NEW.question_id,\n    '/admin/feedback/' || NEW.id\n  );\n  \n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "handle_new_user",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- First insert into users\n  INSERT INTO public.users (id, email)\n  VALUES (new.id, new.email);\n  \n  -- Then create profile\n  INSERT INTO public.profiles (id, email, role_id, subscription_type)\n  VALUES (\n    new.id,\n    new.email,\n    CASE \n      WHEN new.email LIKE '%@prepclex.com' THEN 1  -- Administrator\n      WHEN new.email = 'mcmanaman111@gmail.com' THEN 1  -- Administrator\n      ELSE 6  -- Student (default)\n    END,\n    1  -- Free subscription\n  );\n  \n  RETURN new;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "refresh_test_history_mv",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  REFRESH MATERIALIZED VIEW CONCURRENTLY test_history_mv;\n  RETURN NULL;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "refresh_user_progress",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- Update user_progress when test_statistics are updated\n  WITH new_stats AS (\n    SELECT \n      user_id,\n      COUNT(*) as total_tests,\n      SUM(total_questions) as total_questions,\n      AVG(overall_score) as avg_score\n    FROM test_statistics\n    WHERE user_id = NEW.user_id\n    GROUP BY user_id\n  )\n  UPDATE user_progress up\n  SET \n    total_tests_taken = ns.total_tests,\n    total_questions_completed = ns.total_questions,\n    average_score = ns.avg_score,\n    updated_at = NOW()\n  FROM new_stats ns\n  WHERE up.user_id = ns.user_id;\n  \n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "sync_test_results_status",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- Update question status based on test results\n  PERFORM update_question_status(\n    NEW.user_id,\n    NEW.question_id,\n    CASE\n      WHEN NEW.is_marked THEN 'marked'\n      WHEN NEW.is_skipped THEN 'skipped'\n      WHEN NEW.is_correct THEN 'correct'\n      ELSE 'incorrect'\n    END,\n    NEW.is_correct\n  );\n  \n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "update_answer_statistics",
+    "data_type": "trigger",
+    "column_description": "\nDECLARE\n  total_attempts INTEGER;\n  answer_option INTEGER;\nBEGIN\n  -- Get total attempts for this question\n  SELECT total_attempts INTO total_attempts\n  FROM question_statistics\n  WHERE question_id = NEW.question_id;\n\n  -- If no attempts recorded yet, set to 1\n  IF total_attempts IS NULL THEN\n    total_attempts := 1;\n  END IF;\n\n  -- Initialize statistics for all options if they don't exist\n  INSERT INTO answer_statistics (\n    question_id,\n    answer_id,\n    option_number,\n    times_selected,\n    selection_percentage,\n    last_selected_at\n  )\n  SELECT\n    NEW.question_id,\n    a.id,\n    a.option_number,\n    0,\n    0,\n    NULL\n  FROM answers a\n  WHERE a.question_id = NEW.question_id\n  ON CONFLICT (question_id, option_number) DO NOTHING;\n\n  -- Update selected answers\n  IF NEW.selected_answers IS NOT NULL THEN\n    FOR answer_option IN (\n      SELECT unnest(NEW.selected_answers)\n    )\n    LOOP\n      UPDATE answer_statistics\n      SET\n        times_selected = times_selected + 1,\n        selection_percentage = ((times_selected + 1)::numeric / total_attempts * 100),\n        last_selected_at = NOW(),\n        updated_at = NOW()\n      WHERE question_id = NEW.question_id\n      AND option_number = answer_option;\n    END LOOP;\n  END IF;\n\n  -- Recalculate percentages for all options\n  UPDATE answer_statistics\n  SET selection_percentage = (times_selected::numeric / total_attempts * 100)\n  WHERE question_id = NEW.question_id;\n\n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "update_performance_trend",
+    "data_type": "trigger",
+    "column_description": "\nDECLARE\n  last_7_avg NUMERIC;\n  last_30_avg NUMERIC;\n  last_7_count INTEGER;\n  last_30_count INTEGER;\n  trend_direction TEXT;\nBEGIN\n  -- Calculate 7-day metrics\n  SELECT \n    AVG(overall_score),\n    COUNT(*)\n  INTO last_7_avg, last_7_count\n  FROM test_statistics\n  WHERE user_id = NEW.user_id\n  AND created_at >= NOW() - INTERVAL '7 days';\n\n  -- Calculate 30-day metrics\n  SELECT \n    AVG(overall_score),\n    COUNT(*)\n  INTO last_30_avg, last_30_count\n  FROM test_statistics\n  WHERE user_id = NEW.user_id\n  AND created_at >= NOW() - INTERVAL '30 days';\n\n  -- Determine trend direction\n  trend_direction := CASE\n    WHEN last_7_avg > last_30_avg THEN 'improving'\n    WHEN last_7_avg < last_30_avg THEN 'declining'\n    ELSE 'stable'\n  END;\n\n  -- Update user_progress performance_trend\n  UPDATE user_progress\n  SET performance_trend = jsonb_build_object(\n    'last_7_days', jsonb_build_object(\n      'avg_score', ROUND(COALESCE(last_7_avg, 0), 2),\n      'tests_taken', COALESCE(last_7_count, 0)\n    ),\n    'last_30_days', jsonb_build_object(\n      'avg_score', ROUND(COALESCE(last_30_avg, 0), 2),\n      'tests_taken', COALESCE(last_30_count, 0)\n    ),\n    'trend_direction', trend_direction\n  )\n  WHERE user_id = NEW.user_id;\n\n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "update_question_statistics",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- Insert or update statistics\n  INSERT INTO question_statistics (\n    question_id,\n    total_attempts,\n    correct_attempts,\n    partial_attempts,\n    incorrect_attempts,\n    avg_time_seconds,\n    avg_score,\n    last_attempt_at\n  )\n  VALUES (\n    NEW.question_id,\n    1,\n    CASE WHEN NEW.is_correct THEN 1 ELSE 0 END,\n    CASE WHEN NEW.is_partially_correct THEN 1 ELSE 0 END,\n    CASE WHEN NOT NEW.is_correct AND NOT NEW.is_partially_correct THEN 1 ELSE 0 END,\n    NEW.time_spent_seconds,\n    NEW.score,\n    NOW()\n  )\n  ON CONFLICT (question_id) DO UPDATE\n  SET\n    total_attempts = question_statistics.total_attempts + 1,\n    correct_attempts = question_statistics.correct_attempts + \n      CASE WHEN NEW.is_correct THEN 1 ELSE 0 END,\n    partial_attempts = question_statistics.partial_attempts +\n      CASE WHEN NEW.is_partially_correct THEN 1 ELSE 0 END,\n    incorrect_attempts = question_statistics.incorrect_attempts +\n      CASE WHEN NOT NEW.is_correct AND NOT NEW.is_partially_correct THEN 1 ELSE 0 END,\n    avg_time_seconds = (\n      (question_statistics.avg_time_seconds * question_statistics.total_attempts + NEW.time_spent_seconds) / \n      (question_statistics.total_attempts + 1)\n    ),\n    avg_score = (\n      (question_statistics.avg_score * question_statistics.total_attempts + NEW.score) /\n      (question_statistics.total_attempts + 1)\n    ),\n    last_attempt_at = NOW(),\n    updated_at = NOW();\n\n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "update_question_status",
+    "data_type": "question_status",
+    "column_description": "\nDECLARE\n  result question_status;\nBEGIN\n  -- Check authorization\n  IF p_user_id != auth.uid() AND NOT EXISTS (\n    SELECT 1 FROM profiles WHERE id = auth.uid() AND role_id = 1\n  ) THEN\n    RAISE EXCEPTION 'Not authorized';\n  END IF;\n\n  -- Insert or update status\n  INSERT INTO question_status (\n    user_id,\n    question_id,\n    status,\n    last_attempt_at,\n    attempts_count,\n    correct_count,\n    notes\n  )\n  VALUES (\n    p_user_id,\n    p_question_id,\n    p_status,\n    CASE WHEN p_is_correct IS NOT NULL THEN NOW() ELSE NULL END,\n    CASE WHEN p_is_correct IS NOT NULL THEN 1 ELSE 0 END,\n    CASE WHEN p_is_correct THEN 1 ELSE 0 END,\n    p_notes\n  )\n  ON CONFLICT (user_id, question_id) DO UPDATE\n  SET\n    status = p_status,\n    last_attempt_at = CASE \n      WHEN p_is_correct IS NOT NULL THEN NOW() \n      ELSE question_status.last_attempt_at \n    END,\n    attempts_count = CASE \n      WHEN p_is_correct IS NOT NULL \n      THEN question_status.attempts_count + 1 \n      ELSE question_status.attempts_count \n    END,\n    correct_count = CASE \n      WHEN p_is_correct \n      THEN question_status.correct_count + 1 \n      ELSE question_status.correct_count \n    END,\n    notes = COALESCE(p_notes, question_status.notes),\n    updated_at = NOW()\n  RETURNING *\n  INTO result;\n\n  RETURN result;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "update_question_type_breakdown",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  -- Get question type from questions table\n  WITH question_data AS (\n    SELECT \n      question_type,\n      CASE WHEN NEW.correct_answers > 0 THEN 1 ELSE 0 END as is_correct\n    FROM questions\n    WHERE id = NEW.question_id\n  )\n  UPDATE topic_performance\n  SET question_type_breakdown = jsonb_set(\n    question_type_breakdown,\n    ARRAY[question_data.question_type],\n    jsonb_build_object(\n      'total', COALESCE((question_type_breakdown->question_data.question_type->>'total')::int, 0) + 1,\n      'correct', COALESCE((question_type_breakdown->question_data.question_type->>'correct')::int, 0) + question_data.is_correct\n    )\n  )\n  FROM question_data\n  WHERE topic_performance.id = NEW.id;\n\n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "update_study_streak",
+    "data_type": "trigger",
+    "column_description": "\nDECLARE\n  last_activity DATE;\n  current_streak INTEGER;\n  streak_start DATE;\nBEGIN\n  -- Get current streak info\n  SELECT \n    up.last_study_date,\n    up.current_streak_days,\n    up.streak_start_date\n  INTO \n    last_activity,\n    current_streak,\n    streak_start\n  FROM user_progress up\n  WHERE up.user_id = NEW.user_id;\n\n  -- Calculate new streak\n  IF last_activity IS NULL OR last_activity < CURRENT_DATE - INTERVAL '1 day' THEN\n    -- Streak broken, start new streak\n    UPDATE user_progress\n    SET \n      current_streak_days = 1,\n      streak_start_date = CURRENT_DATE,\n      last_study_date = CURRENT_DATE,\n      longest_streak_days = GREATEST(longest_streak_days, current_streak_days)\n    WHERE user_id = NEW.user_id;\n  ELSE\n    -- Continue streak\n    UPDATE user_progress\n    SET \n      current_streak_days = current_streak_days + 1,\n      last_study_date = CURRENT_DATE,\n      longest_streak_days = GREATEST(longest_streak_days, current_streak_days + 1)\n    WHERE user_id = NEW.user_id\n    AND last_study_date < CURRENT_DATE;\n  END IF;\n\n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Functions",
+    "table_name": null,
+    "column_name": "update_updated_at_column",
+    "data_type": "trigger",
+    "column_description": "\nBEGIN\n  NEW.updated_at = now();\n  RETURN NEW;\nEND;\n"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "answer_id",
+    "data_type": "integer",
+    "column_description": "Reference to the specific answer option"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the answer statistics record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "last_selected_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp of most recent selection"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "option_number",
+    "data_type": "integer",
+    "column_description": "Order number of the answer option"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "selection_percentage",
+    "data_type": "numeric",
+    "column_description": "Percentage of users who selected this option"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "times_selected",
+    "data_type": "integer",
+    "column_description": "Number of times this option was selected"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answer_statistics",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "answer_text",
+    "data_type": "text",
+    "column_description": "Text of the answer option"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the answer was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the answer"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "is_correct",
+    "data_type": "boolean",
+    "column_description": "Indicates if this is a correct answer"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "option_number",
+    "data_type": "integer",
+    "column_description": "Order number of the answer option"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "partial_credit",
+    "data_type": "numeric",
+    "column_description": "Amount of partial credit (0.00-1.00) if applicable"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "penalty_value",
+    "data_type": "numeric",
+    "column_description": "Penalty value (0.00-1.00) for incorrect selection if applicable"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the parent question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "answers",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the answer was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "actions",
+    "data_type": "jsonb",
+    "column_description": "JSON array of possible interventions/actions"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "causes",
+    "data_type": "jsonb",
+    "column_description": "JSON array of possible causes"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "correct_actions",
+    "data_type": "jsonb",
+    "column_description": "JSON array of correct interventions"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "correct_causes",
+    "data_type": "jsonb",
+    "column_description": "JSON array of correct causes"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "correct_effects",
+    "data_type": "jsonb",
+    "column_description": "JSON array of correct outcomes"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the bow-tie question was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "effects",
+    "data_type": "jsonb",
+    "column_description": "JSON array of possible outcomes/effects"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the bow-tie question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "bowtie_questions",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the parent question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "case_studies",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the case study was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "case_studies",
+    "column_name": "description",
+    "data_type": "text",
+    "column_description": "Full case study scenario text"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "case_studies",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the case study"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "case_studies",
+    "column_name": "image_file",
+    "data_type": "text",
+    "column_description": "Optional reference to an image file for the case study"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "case_studies",
+    "column_name": "title",
+    "data_type": "character varying",
+    "column_description": "Title of the case study"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "case_studies",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the case study was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "correct_phrases",
+    "data_type": "jsonb",
+    "column_description": "JSON array of phrases that should be selected"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the enhanced hot spot question was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the enhanced hot spot question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "passage",
+    "data_type": "text",
+    "column_description": "Text passage for highlighting"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the parent question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "selectable_phrases",
+    "data_type": "jsonb",
+    "column_description": "JSON array of phrases that can be selected"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the marked question record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "marked_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the question was marked"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "notes",
+    "data_type": "text",
+    "column_description": "Optional notes about why the question was marked"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the marked question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "status",
+    "data_type": "character varying",
+    "column_description": "Current status of the marked question (pending, reviewed, archived)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "test_id",
+    "data_type": "integer",
+    "column_description": "Reference to the test where the question was marked"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "marked_questions",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user who marked the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "matrix_questions",
+    "column_name": "column_labels",
+    "data_type": "jsonb",
+    "column_description": "JSON array of column labels"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "matrix_questions",
+    "column_name": "correct_answers",
+    "data_type": "jsonb",
+    "column_description": "JSON object mapping correct row/column combinations"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "matrix_questions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the matrix question was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "matrix_questions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the matrix question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "matrix_questions",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the parent question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "matrix_questions",
+    "column_name": "row_labels",
+    "data_type": "jsonb",
+    "column_description": "JSON array of row labels"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "content",
+    "data_type": "text",
+    "column_description": "The note content"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the note was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the note"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "question_id",
+    "data_type": "text",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "sub_topic",
+    "data_type": "text",
+    "column_description": "Sub-topic name for categorization"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "test_id",
+    "data_type": "text",
+    "column_description": "Reference to the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "topic",
+    "data_type": "text",
+    "column_description": "Topic name for categorization"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notes",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user who created the note"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when notification was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the notification"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "link",
+    "data_type": "text",
+    "column_description": "Optional link to relevant content"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "message",
+    "data_type": "text",
+    "column_description": "Notification message"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "read",
+    "data_type": "boolean",
+    "column_description": "Whether the notification has been read"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "title",
+    "data_type": "text",
+    "column_description": "Notification title"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "type",
+    "data_type": "character varying",
+    "column_description": "Type of notification"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "notifications",
+    "column_name": "user_id",
+    "data_type": "text",
+    "column_description": "Target user for the notification"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "avatar_url",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "email",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "full_name",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "id",
+    "data_type": "uuid",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "role_id",
+    "data_type": "integer",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "subscription_active",
+    "data_type": "boolean",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "subscription_ends_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "subscription_type",
+    "data_type": "integer",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "profiles",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "admin_response",
+    "data_type": "text",
+    "column_description": "Administrator response to the feedback"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when feedback was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "difficulty",
+    "data_type": "character varying",
+    "column_description": "User-assessed difficulty level"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the feedback"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "message",
+    "data_type": "text",
+    "column_description": "Feedback message from the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "question_id",
+    "data_type": "text",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "rating",
+    "data_type": "integer",
+    "column_description": "Rating from 1-5 stars"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "status",
+    "data_type": "character varying",
+    "column_description": "Current status of the feedback"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "test_id",
+    "data_type": "text",
+    "column_description": "Reference to the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_feedback",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user who provided feedback"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "avg_score",
+    "data_type": "numeric",
+    "column_description": "Average score achieved on this question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "avg_time_seconds",
+    "data_type": "numeric",
+    "column_description": "Average time spent on this question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "correct_attempts",
+    "data_type": "integer",
+    "column_description": "Number of fully correct attempts"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the statistics record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "incorrect_attempts",
+    "data_type": "integer",
+    "column_description": "Number of incorrect attempts"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "last_attempt_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp of the most recent attempt"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "partial_attempts",
+    "data_type": "integer",
+    "column_description": "Number of partially correct attempts"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "total_attempts",
+    "data_type": "integer",
+    "column_description": "Total number of attempts across all users"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_statistics",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "attempts_count",
+    "data_type": "integer",
+    "column_description": "Number of times the question has been attempted"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "correct_count",
+    "data_type": "integer",
+    "column_description": "Number of correct attempts"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the status record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "last_attempt_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp of the last attempt"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "notes",
+    "data_type": "text",
+    "column_description": "Optional notes about the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "status",
+    "data_type": "character varying",
+    "column_description": "Current status of the question (unused, correct, incorrect, marked, skipped)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "question_status",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "audio_file",
+    "data_type": "text",
+    "column_description": "Reference to audio file for audio questions"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "case_study_id",
+    "data_type": "integer",
+    "column_description": "Optional reference to a case study if the question is part of one"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the question was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "difficulty",
+    "data_type": "character varying",
+    "column_description": "Difficulty level (easy, medium, hard)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "explanation",
+    "data_type": "text",
+    "column_description": "Explanation of the correct answer and rationale"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "image_file",
+    "data_type": "text",
+    "column_description": "Reference to image file for visual questions"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "ngn",
+    "data_type": "boolean",
+    "column_description": "Indicates if this is a Next Generation NCLEX question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "question_format",
+    "data_type": "character varying",
+    "column_description": "Format of the question presentation"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "question_text",
+    "data_type": "text",
+    "column_description": "The actual question text"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "question_type",
+    "data_type": "character varying",
+    "column_description": "Type of question (multiple choice, SATA, etc.)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "ref_sources",
+    "data_type": "jsonb",
+    "column_description": "JSON array of reference sources"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "sub_topic",
+    "data_type": "character varying",
+    "column_description": "Specific subcategory name for the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "sub_topic_id",
+    "data_type": "integer",
+    "column_description": "Reference to the subtopic table"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "topic",
+    "data_type": "character varying",
+    "column_description": "General category name for the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "topic_id",
+    "data_type": "integer",
+    "column_description": "Reference to the topic table"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the question was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "questions",
+    "column_name": "use_partial_scoring",
+    "data_type": "boolean",
+    "column_description": "Indicates if partial credit is allowed"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "roles",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "roles",
+    "column_name": "description",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "roles",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "roles",
+    "column_name": "name",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "roles",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "skipped_questions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "skipped_questions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the skipped question record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "skipped_questions",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the skipped question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "skipped_questions",
+    "column_name": "skipped_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the question was skipped"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "skipped_questions",
+    "column_name": "status",
+    "data_type": "character varying",
+    "column_description": "Current status of the skipped question (pending, attempted, archived)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "skipped_questions",
+    "column_name": "test_id",
+    "data_type": "integer",
+    "column_description": "Reference to the test where the question was skipped"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "skipped_questions",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user who skipped the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subscriptions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subscriptions",
+    "column_name": "description",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subscriptions",
+    "column_name": "duration_days",
+    "data_type": "integer",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subscriptions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subscriptions",
+    "column_name": "name",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subscriptions",
+    "column_name": "stripe_price_id",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subscriptions",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subtopics",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the subtopic was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subtopics",
+    "column_name": "description",
+    "data_type": "text",
+    "column_description": "Detailed description of the subtopic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subtopics",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the subtopic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subtopics",
+    "column_name": "name",
+    "data_type": "character varying",
+    "column_description": "Name of the subtopic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subtopics",
+    "column_name": "topic_id",
+    "data_type": "integer",
+    "column_description": "Reference to the parent topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "subtopics",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the subtopic was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the answer was recorded"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the test answer"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "is_correct",
+    "data_type": "boolean",
+    "column_description": "Indicates if the answer was fully correct"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "nclex_score",
+    "data_type": "integer",
+    "column_description": "NCLEX scoring (0 or 1)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "partial_score",
+    "data_type": "numeric",
+    "column_description": "Partial credit score if applicable"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "selected_answers",
+    "data_type": "ARRAY",
+    "column_description": "Array of selected answer indices"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "test_id",
+    "data_type": "integer",
+    "column_description": "Reference to the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_answers",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the test question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "is_marked",
+    "data_type": "boolean",
+    "column_description": "Indicates if the question is marked for review"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "is_skipped",
+    "data_type": "boolean",
+    "column_description": "Indicates if the question was skipped"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "question_order",
+    "data_type": "integer",
+    "column_description": "Order of the question in the test"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "test_id",
+    "data_type": "integer",
+    "column_description": "Reference to the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "time_spent_seconds",
+    "data_type": "integer",
+    "column_description": "Time spent on this question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_questions",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the result was recorded"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "has_notes",
+    "data_type": "boolean",
+    "column_description": "Indicates if there are notes associated with this question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the test result record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "is_correct",
+    "data_type": "boolean",
+    "column_description": "Indicates if the answer was fully correct"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "is_marked",
+    "data_type": "boolean",
+    "column_description": "Indicates if the question was marked for review"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "is_partially_correct",
+    "data_type": "boolean",
+    "column_description": "Indicates if the answer was partially correct"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "is_skipped",
+    "data_type": "boolean",
+    "column_description": "Indicates if the question was explicitly skipped"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "question_id",
+    "data_type": "integer",
+    "column_description": "Reference to the question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "question_order",
+    "data_type": "integer",
+    "column_description": "Order of the question in the test"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "score",
+    "data_type": "numeric",
+    "column_description": "Score achieved for this question (0-100)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "test_id",
+    "data_type": "integer",
+    "column_description": "Reference to the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "time_spent_seconds",
+    "data_type": "integer",
+    "column_description": "Time spent on this question in seconds"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_results",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user who took the test"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "average_time_per_question",
+    "data_type": "numeric",
+    "column_description": "Average time spent per question"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "correct_answers",
+    "data_type": "integer",
+    "column_description": "Number of fully correct answers"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the statistics were created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the test statistics"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "incorrect_answers",
+    "data_type": "integer",
+    "column_description": "Number of incorrect answers"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "marked_questions",
+    "data_type": "integer",
+    "column_description": "Number of marked questions"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "overall_score",
+    "data_type": "numeric",
+    "column_description": "Overall test score percentage"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "partially_correct",
+    "data_type": "integer",
+    "column_description": "Number of partially correct answers"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "question_type_distribution",
+    "data_type": "jsonb",
+    "column_description": "Distribution of question types in the test with correct/total counts"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "skipped_questions",
+    "data_type": "integer",
+    "column_description": "Number of skipped questions"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "test_id",
+    "data_type": "integer",
+    "column_description": "Reference to the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "total_marked_questions",
+    "data_type": "integer",
+    "column_description": "Total number of questions marked for review"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "total_notes",
+    "data_type": "integer",
+    "column_description": "Total number of questions with notes"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "total_questions",
+    "data_type": "integer",
+    "column_description": "Total number of questions"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_statistics",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "average_score",
+    "data_type": "numeric",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "average_time",
+    "data_type": "numeric",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "last_test_date",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "monthly_stats",
+    "data_type": "jsonb",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "recent_average",
+    "data_type": "numeric",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "recent_tests",
+    "data_type": "jsonb",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "total_ngn_completed",
+    "data_type": "numeric",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "total_questions_completed",
+    "data_type": "bigint",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "total_tests",
+    "data_type": "bigint",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "test_summary_stats_view",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "completion_status",
+    "data_type": "character varying",
+    "column_description": "Current completion status of the test"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the test was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "end_time",
+    "data_type": "timestamp with time zone",
+    "column_description": "When the test was completed"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "settings",
+    "data_type": "jsonb",
+    "column_description": "JSON object containing test settings (timer, tutor mode, etc.)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "start_time",
+    "data_type": "timestamp with time zone",
+    "column_description": "When the test was started"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "status",
+    "data_type": "character varying",
+    "column_description": "Current status of the test"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "test_duration_minutes",
+    "data_type": "integer",
+    "column_description": "Test duration in minutes, automatically calculated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "test_mode",
+    "data_type": "character varying",
+    "column_description": "Mode of the test (practice, simulation, review, custom)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "test_template_id",
+    "data_type": "integer",
+    "column_description": "Reference to a test template if using a pre-defined format"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "test_type",
+    "data_type": "character varying",
+    "column_description": "Type of test (practice, quick start, or custom)"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "total_questions",
+    "data_type": "integer",
+    "column_description": "Total number of questions in the test"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "total_time_seconds",
+    "data_type": "integer",
+    "column_description": "Total time spent on the test in seconds"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the test was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "tests",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user taking the test"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "correct_answers",
+    "data_type": "integer",
+    "column_description": "Number of correct answers"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the topic performance record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "incorrect_answers",
+    "data_type": "integer",
+    "column_description": "Number of incorrect answers"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "ngn_questions",
+    "data_type": "integer",
+    "column_description": "Number of NGN questions in this topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "question_type_breakdown",
+    "data_type": "jsonb",
+    "column_description": "JSON object containing performance metrics for each question type"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "score_percentage",
+    "data_type": "numeric",
+    "column_description": "Score percentage for this topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "subtopic_id",
+    "data_type": "integer",
+    "column_description": "Reference to the subtopic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "test_id",
+    "data_type": "integer",
+    "column_description": "Reference to the test session"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "topic_id",
+    "data_type": "integer",
+    "column_description": "Reference to the topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "total_questions",
+    "data_type": "integer",
+    "column_description": "Total questions in this topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topic_performance",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topics",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the topic was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topics",
+    "column_name": "description",
+    "data_type": "text",
+    "column_description": "Detailed description of the topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topics",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topics",
+    "column_name": "name",
+    "data_type": "character varying",
+    "column_description": "Name of the topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "topics",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the topic was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "average_score",
+    "data_type": "numeric",
+    "column_description": "Overall average score"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "current_streak_days",
+    "data_type": "integer",
+    "column_description": "Current study streak in days"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "exam_date",
+    "data_type": "date",
+    "column_description": "Scheduled NCLEX exam date"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the progress record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "last_activity_date",
+    "data_type": "date",
+    "column_description": "Date of last activity"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "last_study_date",
+    "data_type": "date",
+    "column_description": "Date of last study activity"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "longest_streak_days",
+    "data_type": "integer",
+    "column_description": "Longest study streak achieved in days"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "performance_trend",
+    "data_type": "jsonb",
+    "column_description": "JSON object containing recent performance trends and metrics"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "streak_start_date",
+    "data_type": "date",
+    "column_description": "Date when the current streak started"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "total_questions_completed",
+    "data_type": "integer",
+    "column_description": "Total questions answered"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "total_study_time_minutes",
+    "data_type": "integer",
+    "column_description": "Total study time in minutes"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "total_tests_taken",
+    "data_type": "integer",
+    "column_description": "Total number of tests completed"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_progress",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was created"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "id",
+    "data_type": "integer",
+    "column_description": "Unique identifier for the mastery record"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "last_attempt_date",
+    "data_type": "timestamp with time zone",
+    "column_description": "Date of last attempt"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "mastery_level",
+    "data_type": "character varying",
+    "column_description": "Current mastery level for the topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "questions_attempted",
+    "data_type": "integer",
+    "column_description": "Number of questions attempted"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "questions_correct",
+    "data_type": "integer",
+    "column_description": "Number of questions answered correctly"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "topic_id",
+    "data_type": "integer",
+    "column_description": "Reference to the topic"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": "Timestamp when the record was last updated"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "user_topic_mastery",
+    "column_name": "user_id",
+    "data_type": "uuid",
+    "column_description": "Reference to the user"
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "users",
+    "column_name": "created_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "users",
+    "column_name": "email",
+    "data_type": "text",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "users",
+    "column_name": "id",
+    "data_type": "uuid",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "users",
+    "column_name": "is_active",
+    "data_type": "boolean",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "users",
+    "column_name": "last_login",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Table Columns",
+    "table_name": "users",
+    "column_name": "updated_at",
+    "data_type": "timestamp with time zone",
+    "column_description": null
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answer_statistics",
+    "column_name": "RI_ConstraintTrigger_c_35657",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35657\" AFTER INSERT ON public.answer_statistics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answer_statistics",
+    "column_name": "RI_ConstraintTrigger_c_35658",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35658\" AFTER UPDATE ON public.answer_statistics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answer_statistics",
+    "column_name": "RI_ConstraintTrigger_c_35662",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35662\" AFTER INSERT ON public.answer_statistics FROM answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answer_statistics",
+    "column_name": "RI_ConstraintTrigger_c_35663",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35663\" AFTER UPDATE ON public.answer_statistics FROM answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answers",
+    "column_name": "RI_ConstraintTrigger_a_35660",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35660\" AFTER DELETE ON public.answers FROM answer_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answers",
+    "column_name": "RI_ConstraintTrigger_a_35661",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35661\" AFTER UPDATE ON public.answers FROM answer_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answers",
+    "column_name": "RI_ConstraintTrigger_c_32882",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32882\" AFTER INSERT ON public.answers FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answers",
+    "column_name": "RI_ConstraintTrigger_c_32883",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32883\" AFTER UPDATE ON public.answers FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "answers",
+    "column_name": "update_answers_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_answers_updated_at BEFORE UPDATE ON public.answers FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "bowtie_questions",
+    "column_name": "RI_ConstraintTrigger_c_32912",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32912\" AFTER INSERT ON public.bowtie_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "bowtie_questions",
+    "column_name": "RI_ConstraintTrigger_c_32913",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32913\" AFTER UPDATE ON public.bowtie_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "case_studies",
+    "column_name": "RI_ConstraintTrigger_a_32861",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32861\" AFTER DELETE ON public.case_studies FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "case_studies",
+    "column_name": "RI_ConstraintTrigger_a_32862",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32862\" AFTER UPDATE ON public.case_studies FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "case_studies",
+    "column_name": "update_case_studies_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_case_studies_updated_at BEFORE UPDATE ON public.case_studies FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "RI_ConstraintTrigger_c_32927",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32927\" AFTER INSERT ON public.enhanced_hot_spot_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "enhanced_hot_spot_questions",
+    "column_name": "RI_ConstraintTrigger_c_32928",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32928\" AFTER UPDATE ON public.enhanced_hot_spot_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "marked_questions",
+    "column_name": "RI_ConstraintTrigger_c_33558",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33558\" AFTER INSERT ON public.marked_questions FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "marked_questions",
+    "column_name": "RI_ConstraintTrigger_c_33559",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33559\" AFTER UPDATE ON public.marked_questions FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "marked_questions",
+    "column_name": "RI_ConstraintTrigger_c_33563",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33563\" AFTER INSERT ON public.marked_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "marked_questions",
+    "column_name": "RI_ConstraintTrigger_c_33564",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33564\" AFTER UPDATE ON public.marked_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "marked_questions",
+    "column_name": "RI_ConstraintTrigger_c_33568",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33568\" AFTER INSERT ON public.marked_questions FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "marked_questions",
+    "column_name": "RI_ConstraintTrigger_c_33569",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33569\" AFTER UPDATE ON public.marked_questions FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "matrix_questions",
+    "column_name": "RI_ConstraintTrigger_c_32897",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32897\" AFTER INSERT ON public.matrix_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "matrix_questions",
+    "column_name": "RI_ConstraintTrigger_c_32898",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32898\" AFTER UPDATE ON public.matrix_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "notes",
+    "column_name": "RI_ConstraintTrigger_c_33587",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33587\" AFTER INSERT ON public.notes FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "notes",
+    "column_name": "RI_ConstraintTrigger_c_33588",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33588\" AFTER UPDATE ON public.notes FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "profiles",
+    "column_name": "RI_ConstraintTrigger_c_29410",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29410\" AFTER INSERT ON public.profiles FROM roles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "profiles",
+    "column_name": "RI_ConstraintTrigger_c_29411",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29411\" AFTER UPDATE ON public.profiles FROM roles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "profiles",
+    "column_name": "RI_ConstraintTrigger_c_29415",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29415\" AFTER INSERT ON public.profiles FROM subscriptions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "profiles",
+    "column_name": "RI_ConstraintTrigger_c_29416",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29416\" AFTER UPDATE ON public.profiles FROM subscriptions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "profiles",
+    "column_name": "RI_ConstraintTrigger_c_29476",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29476\" AFTER INSERT ON public.profiles FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "profiles",
+    "column_name": "RI_ConstraintTrigger_c_29477",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29477\" AFTER UPDATE ON public.profiles FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "profiles",
+    "column_name": "update_profiles_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_profiles_updated_at BEFORE UPDATE ON public.profiles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_feedback",
+    "column_name": "RI_ConstraintTrigger_c_35435",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35435\" AFTER INSERT ON public.question_feedback FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_feedback",
+    "column_name": "RI_ConstraintTrigger_c_35436",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35436\" AFTER UPDATE ON public.question_feedback FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_feedback",
+    "column_name": "on_feedback_response",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER on_feedback_response BEFORE UPDATE ON public.question_feedback FOR EACH ROW EXECUTE FUNCTION handle_feedback_response()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_feedback",
+    "column_name": "on_new_feedback",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER on_new_feedback AFTER INSERT ON public.question_feedback FOR EACH ROW EXECUTE FUNCTION handle_new_feedback()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_statistics",
+    "column_name": "RI_ConstraintTrigger_c_35606",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35606\" AFTER INSERT ON public.question_statistics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_statistics",
+    "column_name": "RI_ConstraintTrigger_c_35607",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35607\" AFTER UPDATE ON public.question_statistics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_status",
+    "column_name": "RI_ConstraintTrigger_c_35339",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35339\" AFTER INSERT ON public.question_status FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_status",
+    "column_name": "RI_ConstraintTrigger_c_35340",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35340\" AFTER UPDATE ON public.question_status FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_status",
+    "column_name": "RI_ConstraintTrigger_c_35344",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35344\" AFTER INSERT ON public.question_status FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "question_status",
+    "column_name": "RI_ConstraintTrigger_c_35345",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_35345\" AFTER UPDATE ON public.question_status FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32880",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32880\" AFTER DELETE ON public.questions FROM answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32881",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32881\" AFTER UPDATE ON public.questions FROM answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32895",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32895\" AFTER DELETE ON public.questions FROM matrix_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32896",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32896\" AFTER UPDATE ON public.questions FROM matrix_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32910",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32910\" AFTER DELETE ON public.questions FROM bowtie_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32911",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32911\" AFTER UPDATE ON public.questions FROM bowtie_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32925",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32925\" AFTER DELETE ON public.questions FROM enhanced_hot_spot_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_32926",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32926\" AFTER UPDATE ON public.questions FROM enhanced_hot_spot_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33246",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33246\" AFTER DELETE ON public.questions FROM test_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33247",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33247\" AFTER UPDATE ON public.questions FROM test_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33273",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33273\" AFTER DELETE ON public.questions FROM test_answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33274",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33274\" AFTER UPDATE ON public.questions FROM test_answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33561",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33561\" AFTER DELETE ON public.questions FROM marked_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33562",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33562\" AFTER UPDATE ON public.questions FROM marked_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33629",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33629\" AFTER DELETE ON public.questions FROM skipped_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33630",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33630\" AFTER UPDATE ON public.questions FROM skipped_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33661",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33661\" AFTER DELETE ON public.questions FROM test_results NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_33662",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33662\" AFTER UPDATE ON public.questions FROM test_results NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_35342",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35342\" AFTER DELETE ON public.questions FROM question_status NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_35343",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35343\" AFTER UPDATE ON public.questions FROM question_status NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_35604",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35604\" AFTER DELETE ON public.questions FROM question_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_35605",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35605\" AFTER UPDATE ON public.questions FROM question_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_35655",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35655\" AFTER DELETE ON public.questions FROM answer_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_a_35656",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35656\" AFTER UPDATE ON public.questions FROM answer_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_c_32853",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32853\" AFTER INSERT ON public.questions FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_c_32854",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32854\" AFTER UPDATE ON public.questions FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_c_32858",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32858\" AFTER INSERT ON public.questions FROM subtopics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_c_32859",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32859\" AFTER UPDATE ON public.questions FROM subtopics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_c_32863",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32863\" AFTER INSERT ON public.questions FROM case_studies NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "RI_ConstraintTrigger_c_32864",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32864\" AFTER UPDATE ON public.questions FROM case_studies NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "questions",
+    "column_name": "update_questions_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_questions_updated_at BEFORE UPDATE ON public.questions FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "roles",
+    "column_name": "RI_ConstraintTrigger_a_29408",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_29408\" AFTER DELETE ON public.roles FROM profiles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "roles",
+    "column_name": "RI_ConstraintTrigger_a_29409",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_29409\" AFTER UPDATE ON public.roles FROM profiles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "roles",
+    "column_name": "update_roles_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_roles_updated_at BEFORE UPDATE ON public.roles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "skipped_questions",
+    "column_name": "RI_ConstraintTrigger_c_33626",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33626\" AFTER INSERT ON public.skipped_questions FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "skipped_questions",
+    "column_name": "RI_ConstraintTrigger_c_33627",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33627\" AFTER UPDATE ON public.skipped_questions FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "skipped_questions",
+    "column_name": "RI_ConstraintTrigger_c_33631",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33631\" AFTER INSERT ON public.skipped_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "skipped_questions",
+    "column_name": "RI_ConstraintTrigger_c_33632",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33632\" AFTER UPDATE ON public.skipped_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "skipped_questions",
+    "column_name": "RI_ConstraintTrigger_c_33636",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33636\" AFTER INSERT ON public.skipped_questions FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "skipped_questions",
+    "column_name": "RI_ConstraintTrigger_c_33637",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33637\" AFTER UPDATE ON public.skipped_questions FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subscriptions",
+    "column_name": "RI_ConstraintTrigger_a_29413",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_29413\" AFTER DELETE ON public.subscriptions FROM profiles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subscriptions",
+    "column_name": "RI_ConstraintTrigger_a_29414",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_29414\" AFTER UPDATE ON public.subscriptions FROM profiles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subscriptions",
+    "column_name": "update_subscriptions_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_subscriptions_updated_at BEFORE UPDATE ON public.subscriptions FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subtopics",
+    "column_name": "RI_ConstraintTrigger_a_32856",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32856\" AFTER DELETE ON public.subtopics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subtopics",
+    "column_name": "RI_ConstraintTrigger_a_32857",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32857\" AFTER UPDATE ON public.subtopics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subtopics",
+    "column_name": "RI_ConstraintTrigger_a_33322",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33322\" AFTER DELETE ON public.subtopics FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subtopics",
+    "column_name": "RI_ConstraintTrigger_a_33323",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33323\" AFTER UPDATE ON public.subtopics FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subtopics",
+    "column_name": "RI_ConstraintTrigger_c_32822",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32822\" AFTER INSERT ON public.subtopics FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subtopics",
+    "column_name": "RI_ConstraintTrigger_c_32823",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_32823\" AFTER UPDATE ON public.subtopics FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "subtopics",
+    "column_name": "update_subtopics_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_subtopics_updated_at BEFORE UPDATE ON public.subtopics FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_answers",
+    "column_name": "RI_ConstraintTrigger_c_33270",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33270\" AFTER INSERT ON public.test_answers FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_answers",
+    "column_name": "RI_ConstraintTrigger_c_33271",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33271\" AFTER UPDATE ON public.test_answers FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_answers",
+    "column_name": "RI_ConstraintTrigger_c_33275",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33275\" AFTER INSERT ON public.test_answers FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_answers",
+    "column_name": "RI_ConstraintTrigger_c_33276",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33276\" AFTER UPDATE ON public.test_answers FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_answers",
+    "column_name": "RI_ConstraintTrigger_c_33497",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33497\" AFTER INSERT ON public.test_answers FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_answers",
+    "column_name": "RI_ConstraintTrigger_c_33498",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33498\" AFTER UPDATE ON public.test_answers FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_questions",
+    "column_name": "RI_ConstraintTrigger_c_33243",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33243\" AFTER INSERT ON public.test_questions FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_questions",
+    "column_name": "RI_ConstraintTrigger_c_33244",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33244\" AFTER UPDATE ON public.test_questions FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_questions",
+    "column_name": "RI_ConstraintTrigger_c_33248",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33248\" AFTER INSERT ON public.test_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_questions",
+    "column_name": "RI_ConstraintTrigger_c_33249",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33249\" AFTER UPDATE ON public.test_questions FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_questions",
+    "column_name": "RI_ConstraintTrigger_c_33492",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33492\" AFTER INSERT ON public.test_questions FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_questions",
+    "column_name": "RI_ConstraintTrigger_c_33493",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33493\" AFTER UPDATE ON public.test_questions FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "RI_ConstraintTrigger_c_33653",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33653\" AFTER INSERT ON public.test_results FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "RI_ConstraintTrigger_c_33654",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33654\" AFTER UPDATE ON public.test_results FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "RI_ConstraintTrigger_c_33658",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33658\" AFTER INSERT ON public.test_results FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "RI_ConstraintTrigger_c_33659",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33659\" AFTER UPDATE ON public.test_results FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "RI_ConstraintTrigger_c_33663",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33663\" AFTER INSERT ON public.test_results FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "RI_ConstraintTrigger_c_33664",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33664\" AFTER UPDATE ON public.test_results FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "sync_question_status",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER sync_question_status AFTER INSERT OR UPDATE ON public.test_results FOR EACH ROW EXECUTE FUNCTION sync_test_results_status()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "update_answer_stats",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_answer_stats AFTER INSERT OR UPDATE ON public.test_results FOR EACH ROW EXECUTE FUNCTION update_answer_statistics()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_results",
+    "column_name": "update_question_stats",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_question_stats AFTER INSERT OR UPDATE ON public.test_results FOR EACH ROW EXECUTE FUNCTION update_question_statistics()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "RI_ConstraintTrigger_c_33296",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33296\" AFTER INSERT ON public.test_statistics FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "RI_ConstraintTrigger_c_33297",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33297\" AFTER UPDATE ON public.test_statistics FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "RI_ConstraintTrigger_c_33502",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33502\" AFTER INSERT ON public.test_statistics FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "RI_ConstraintTrigger_c_33503",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33503\" AFTER UPDATE ON public.test_statistics FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "maintain_study_streak",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER maintain_study_streak AFTER INSERT OR UPDATE ON public.test_statistics FOR EACH ROW EXECUTE FUNCTION update_study_streak()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "refresh_test_history_after_stats",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER refresh_test_history_after_stats AFTER INSERT OR DELETE OR UPDATE ON public.test_statistics FOR EACH STATEMENT EXECUTE FUNCTION refresh_test_history_mv()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "update_performance_trend_trigger",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_performance_trend_trigger AFTER INSERT OR UPDATE ON public.test_statistics FOR EACH ROW EXECUTE FUNCTION update_performance_trend()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "update_question_type_distribution",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_question_type_distribution AFTER INSERT ON public.test_statistics FOR EACH ROW EXECUTE FUNCTION calculate_question_type_distribution()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "test_statistics",
+    "column_name": "update_user_progress_stats",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_user_progress_stats AFTER INSERT OR UPDATE ON public.test_statistics FOR EACH ROW EXECUTE FUNCTION refresh_user_progress()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33241",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33241\" AFTER DELETE ON public.tests FROM test_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33242",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33242\" AFTER UPDATE ON public.tests FROM test_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33268",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33268\" AFTER DELETE ON public.tests FROM test_answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33269",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33269\" AFTER UPDATE ON public.tests FROM test_answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33294",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33294\" AFTER DELETE ON public.tests FROM test_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33295",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33295\" AFTER UPDATE ON public.tests FROM test_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33312",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33312\" AFTER DELETE ON public.tests FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33313",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33313\" AFTER UPDATE ON public.tests FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33566",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33566\" AFTER DELETE ON public.tests FROM marked_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33567",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33567\" AFTER UPDATE ON public.tests FROM marked_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33634",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33634\" AFTER DELETE ON public.tests FROM skipped_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33635",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33635\" AFTER UPDATE ON public.tests FROM skipped_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33651",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33651\" AFTER DELETE ON public.tests FROM test_results NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_a_33652",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33652\" AFTER UPDATE ON public.tests FROM test_results NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_c_33487",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33487\" AFTER INSERT ON public.tests FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "RI_ConstraintTrigger_c_33488",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33488\" AFTER UPDATE ON public.tests FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "refresh_test_history_after_test",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER refresh_test_history_after_test AFTER INSERT OR DELETE OR UPDATE ON public.tests FOR EACH STATEMENT EXECUTE FUNCTION refresh_test_history_mv()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "tests",
+    "column_name": "update_tests_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_tests_updated_at BEFORE UPDATE ON public.tests FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33314",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33314\" AFTER INSERT ON public.topic_performance FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33315",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33315\" AFTER UPDATE ON public.topic_performance FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33319",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33319\" AFTER INSERT ON public.topic_performance FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33320",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33320\" AFTER UPDATE ON public.topic_performance FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33324",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33324\" AFTER INSERT ON public.topic_performance FROM subtopics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33325",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33325\" AFTER UPDATE ON public.topic_performance FROM subtopics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33507",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33507\" AFTER INSERT ON public.topic_performance FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "RI_ConstraintTrigger_c_33508",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33508\" AFTER UPDATE ON public.topic_performance FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topic_performance",
+    "column_name": "update_question_type_breakdown",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_question_type_breakdown AFTER INSERT OR UPDATE OF correct_answers ON public.topic_performance FOR EACH ROW EXECUTE FUNCTION update_question_type_breakdown()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_32820",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32820\" AFTER DELETE ON public.topics FROM subtopics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_32821",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32821\" AFTER UPDATE ON public.topics FROM subtopics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_32851",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32851\" AFTER DELETE ON public.topics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_32852",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_32852\" AFTER UPDATE ON public.topics FROM questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_33317",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33317\" AFTER DELETE ON public.topics FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_33318",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33318\" AFTER UPDATE ON public.topics FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_33364",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33364\" AFTER DELETE ON public.topics FROM user_topic_mastery NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "RI_ConstraintTrigger_a_33365",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33365\" AFTER UPDATE ON public.topics FROM user_topic_mastery NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "topics",
+    "column_name": "update_topics_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_topics_updated_at BEFORE UPDATE ON public.topics FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_progress",
+    "column_name": "RI_ConstraintTrigger_c_33512",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33512\" AFTER INSERT ON public.user_progress FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_progress",
+    "column_name": "RI_ConstraintTrigger_c_33513",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33513\" AFTER UPDATE ON public.user_progress FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_progress",
+    "column_name": "update_user_progress_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_user_progress_updated_at BEFORE UPDATE ON public.user_progress FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_topic_mastery",
+    "column_name": "RI_ConstraintTrigger_c_33366",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33366\" AFTER INSERT ON public.user_topic_mastery FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_topic_mastery",
+    "column_name": "RI_ConstraintTrigger_c_33367",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33367\" AFTER UPDATE ON public.user_topic_mastery FROM topics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_topic_mastery",
+    "column_name": "RI_ConstraintTrigger_c_33517",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33517\" AFTER INSERT ON public.user_topic_mastery FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_topic_mastery",
+    "column_name": "RI_ConstraintTrigger_c_33518",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_33518\" AFTER UPDATE ON public.user_topic_mastery FROM users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "user_topic_mastery",
+    "column_name": "update_user_topic_mastery_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_user_topic_mastery_updated_at BEFORE UPDATE ON public.user_topic_mastery FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_29474",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_29474\" AFTER DELETE ON public.users FROM profiles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_29475",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_29475\" AFTER UPDATE ON public.users FROM profiles NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33485",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33485\" AFTER DELETE ON public.users FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33486",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33486\" AFTER UPDATE ON public.users FROM tests NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33490",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33490\" AFTER DELETE ON public.users FROM test_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33491",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33491\" AFTER UPDATE ON public.users FROM test_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33495",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33495\" AFTER DELETE ON public.users FROM test_answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33496",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33496\" AFTER UPDATE ON public.users FROM test_answers NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33500",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33500\" AFTER DELETE ON public.users FROM test_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33501",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33501\" AFTER UPDATE ON public.users FROM test_statistics NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33505",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33505\" AFTER DELETE ON public.users FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33506",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33506\" AFTER UPDATE ON public.users FROM topic_performance NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33510",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33510\" AFTER DELETE ON public.users FROM user_progress NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33511",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33511\" AFTER UPDATE ON public.users FROM user_progress NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33515",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33515\" AFTER DELETE ON public.users FROM user_topic_mastery NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33516",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33516\" AFTER UPDATE ON public.users FROM user_topic_mastery NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33556",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33556\" AFTER DELETE ON public.users FROM marked_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33557",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33557\" AFTER UPDATE ON public.users FROM marked_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33585",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33585\" AFTER DELETE ON public.users FROM notes NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33586",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33586\" AFTER UPDATE ON public.users FROM notes NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33624",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33624\" AFTER DELETE ON public.users FROM skipped_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33625",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33625\" AFTER UPDATE ON public.users FROM skipped_questions NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33656",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33656\" AFTER DELETE ON public.users FROM test_results NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_33657",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_33657\" AFTER UPDATE ON public.users FROM test_results NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_35337",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35337\" AFTER DELETE ON public.users FROM question_status NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_35338",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35338\" AFTER UPDATE ON public.users FROM question_status NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_35433",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35433\" AFTER DELETE ON public.users FROM question_feedback NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_a_35434",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_35434\" AFTER UPDATE ON public.users FROM question_feedback NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_c_29471",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29471\" AFTER INSERT ON public.users FROM auth.users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "RI_ConstraintTrigger_c_29472",
+    "data_type": null,
+    "column_description": "CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_29472\" AFTER UPDATE ON public.users FROM auth.users NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()"
+  },
+  {
+    "category": "Triggers",
+    "table_name": "users",
+    "column_name": "update_users_updated_at",
+    "data_type": null,
+    "column_description": "CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()"
+  }
+]

@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --chart-grid: rgba(148, 163, 184, 0.1);
+  --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.dark {
+  --chart-grid: rgba(148, 163, 184, 0.05);
+}
+
+body {
+  @apply antialiased;
+  font-family: var(--font-family);
+}
+
+/* Custom scrollbar for modern browsers */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 dark:bg-gray-700 rounded-full;
+}
+
+/* Chart customizations */
+.chart-container {
+  @apply rounded-xl bg-white dark:bg-dark-lighter p-6 shadow-lg transition-colors;
+}
+
+.chart-container canvas {
+  @apply !h-[300px];
+}
+
+/* Card styles matching the design */
+.stat-card {
+  @apply bg-white dark:bg-dark-lighter rounded-xl p-6 shadow-lg transition-all hover:shadow-xl;
+  background: linear-gradient(145deg, #ffffff 0%, #f8fafc 100%);
+}
+
+.dark .stat-card {
+  background: linear-gradient(145deg, #1e293b 0%, #0f172a 100%);
+}
+
+/* Typography improvements */
+h1, h2, h3, h4, h5, h6 {
+  @apply tracking-tight;
+}
+
+.chart-title {
+  @apply text-lg font-semibold text-gray-800 dark:text-gray-200 mb-4;
+}
