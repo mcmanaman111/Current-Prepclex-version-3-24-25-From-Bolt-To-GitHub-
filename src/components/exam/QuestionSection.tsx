@@ -1,10 +1,10 @@
 import React from 'react';
 import { Check, X } from 'lucide-react';
 import ScoreDisplay from './ScoreDisplay';
-import { Question, Score } from '../../types/exam';
+import { TestQuestion, Score } from '../../types/exam';
 
 interface Props {
-  question: Question;
+  question: TestQuestion;
   selectedAnswers: number[];
   isSubmitted: boolean;
   onAnswerSelect: (index: number) => void;
@@ -14,6 +14,7 @@ interface Props {
   cumulativeTestNumber?: number;
   isStackedView?: boolean;
   isSplitView?: boolean;
+  actualTimeTaken?: number;
 }
 
 const QuestionSection = ({ 
@@ -26,7 +27,8 @@ const QuestionSection = ({
   userId = "12345",
   cumulativeTestNumber = 1212,
   isStackedView = true,
-  isSplitView = false
+  isSplitView = false,
+  actualTimeTaken = 0
 }: Props) => {
   const renderAnswerIndicator = (index: number) => {
     if (!isSubmitted) return null;
@@ -42,15 +44,38 @@ const QuestionSection = ({
   // Use stacked view padding unless in split view mode with submitted answer
   const shouldUseStackedPadding = !isSplitView || !isSubmitted;
 
+  // Handle mapping between our TestQuestion type and the expected data structure
+  const questionText = question.question_text || '';
+  const choices = question.choices || [];
+  
+  // Format time from seconds to MM:SS
+  const formatTimeMMSS = (seconds: number): string => {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+  };
+  
+  // Build statistics object with actual time taken
+  const statistics = {
+    clientNeedArea: question.topic || 'General',
+    clientNeedTopic: question.sub_topic || 'Unknown',
+    percentCorrect: 0,
+    difficulty: question.difficulty || 'Medium',
+    // Use actual time if available, otherwise fall back to the stored time or default
+    timeTaken: actualTimeTaken > 0 
+      ? formatTimeMMSS(actualTimeTaken) 
+      : question.time_taken || '0:05'
+  };
+
   return (
     <div className={`p-6 pb-8 mt-8 ${shouldUseStackedPadding ? 'md:px-[calc(12rem_+_1.5rem)]' : 'md:px-12'}`}>
       <div className="pl-4">
         <div className="mb-8">
-          <p className="text-lg text-gray-800 dark:text-gray-200 question-text">{question.text}</p>
+          <p className="text-lg text-gray-800 dark:text-gray-200 question-text">{questionText}</p>
         </div>
 
         <div className="space-y-3 mb-12">
-          {question.choices.map((choice, index) => (
+          {choices.map((choice, index) => (
             <div
               key={index}
               className={`relative flex items-start gap-3 py-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50 ${
@@ -89,8 +114,8 @@ const QuestionSection = ({
         {isSubmitted && score && (
           <ScoreDisplay 
             score={score} 
-            statistics={question.statistics} 
-            questionId={question.qid}
+            statistics={statistics} 
+            questionId={question.id.toString()}
             testNumber={testNumber}
             userId={userId}
             cumulativeTestNumber={cumulativeTestNumber}

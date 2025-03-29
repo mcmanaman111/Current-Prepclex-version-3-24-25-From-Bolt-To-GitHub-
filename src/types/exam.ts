@@ -1,24 +1,25 @@
-// Add these types to the existing exam.ts file
-
-export interface ClientNeedsData {
-  [area: string]: {
-    correct: number;
-    total: number;
-    topics: {
-      [topic: string]: {
-        correct: number;
-        total: number;
-      };
-    };
-  };
+export interface Score {
+  correct: number;
+  total: number;
+  incorrect: number;
+  isFullyCorrect: boolean;
+  nclexScore: number;
+  percentage: number;
 }
 
-export interface TestResultsData {
-  testId: string;
-  questions: Question[];
-  scores: Record<string, Score>;
-  markedQuestions: number[];
-  startTime: string;
-  endTime: string;
-  elapsedTime: string;
+export interface TestQuestion {
+  id: number;
+  question_text: string;
+  choices: { text: string; isCorrect: boolean }[];
+  explanation: string;
+  references?: string | string[];  // Legacy field
+  ref_sources?: string | string[]; // Primary field that matches the database column
+  topic: string;
+  sub_topic: string;
+  topic_id: number;
+  sub_topic_id: number;
+  question_type: string;
+  difficulty: string;
+  ngn: boolean;
+  time_taken?: string;
 }

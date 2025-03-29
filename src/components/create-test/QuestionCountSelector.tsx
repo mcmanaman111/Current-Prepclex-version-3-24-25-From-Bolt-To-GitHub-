@@ -8,7 +8,7 @@ interface Props {
   totalSelectedQuestions: number;
 }
 
-const MAX_QUESTIONS = 75;
+const MAX_QUESTIONS = 85;
 
 const QuestionCountSelector = ({ 
   availableQuestions, 
@@ -55,7 +55,7 @@ const QuestionCountSelector = ({
           <Hash className="w-6 h-6 text-[#2B3467]" />
           <h3 className="text-xl font-semibold text-[#2B3467]">Select Number of Questions</h3>
         </div>
-        <p className="text-sm text-gray-500">Choose between 1-75 questions for your test</p>
+        <p className="text-sm text-gray-500">Choose between 1-85 questions for your test</p>
       </div>
 
       <div className="flex flex-col items-center gap-6">
@@ -84,7 +84,7 @@ const QuestionCountSelector = ({
             />
             <div className="flex justify-between mt-1">
               <span className="text-sm text-gray-500">1</span>
-              <span className="text-sm text-gray-500">75</span>
+              <span className="text-sm text-gray-500">85</span>
             </div>
           </div>
         </div>

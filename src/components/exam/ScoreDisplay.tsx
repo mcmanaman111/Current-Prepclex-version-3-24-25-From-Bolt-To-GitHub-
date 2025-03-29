@@ -1,15 +1,24 @@
 import React from 'react';
 import { Activity, Users, Timer, Gauge, CheckCircle2, AlertCircle, XCircle } from 'lucide-react';
-import { Score, QuestionStatistics } from '../../types/exam';
+import { Score } from '../../types/exam';
 import { getDifficultyBadgeColor } from '../../utils/examUtils';
+
+interface Statistics {
+  clientNeedArea?: string;
+  clientNeedTopic?: string;
+  percentCorrect?: number;
+  difficulty?: string;
+  avgPeerScore?: string;
+  timeTaken?: string;
+}
 
 interface Props {
   score: Score;
-  statistics: QuestionStatistics;
+  statistics: Statistics;
   questionId: string;
-  testNumber: number;
-  userId: string;
-  cumulativeTestNumber: number;
+  testNumber?: number;
+  userId?: string;
+  cumulativeTestNumber?: number;
 }
 
 const ScoreDisplay = ({ 
@@ -44,6 +53,10 @@ const ScoreDisplay = ({
     textColor = "text-red-700 dark:text-red-400";
   }
 
+  const avgPeerScore = statistics.avgPeerScore || "N/A";
+  const timeTaken = statistics.timeTaken || "N/A";
+  const difficulty = statistics.difficulty || "Medium";
+
   return (
     <div className="mt-12 space-y-8">
       <div className={`${bgColor} ${textColor} px-6 py-4 rounded-full flex items-center justify-center gap-3`}>
@@ -60,24 +73,17 @@ const ScoreDisplay = ({
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <Users className="w-4 h-4 text-gray-500 dark:text-gray-400" />
-          <span className="text-sm text-gray-600 dark:text-gray-300">Avg. Peer Score:</span>
-          <span className="px-2 py-1 text-xs font-medium bg-purple-100 text-purple-700 dark:bg-purple-900/20 dark:text-purple-400 rounded-full">
-            {statistics.avgPeerScore}
+          <Gauge className="w-4 h-4 text-gray-500 dark:text-gray-400" />
+          <span className="text-sm text-gray-600 dark:text-gray-300">Difficulty:</span>
+          <span className={`px-2 py-1 text-xs font-medium rounded-full ${getDifficultyBadgeColor(difficulty)}`}>
+            {difficulty}
           </span>
         </div>
         <div className="flex items-center gap-2">
           <Timer className="w-4 h-4 text-gray-500 dark:text-gray-400" />
           <span className="text-sm text-gray-600 dark:text-gray-300">Time:</span>
-          <span className="px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-700 dark:bg-yellow-900/20 dark:text-yellow-400 rounded-full">
-            {statistics.timeTaken}
-          </span>
-        </div>
-        <div className="flex items-center gap-2">
-          <Gauge className="w-4 h-4 text-gray-500 dark:text-gray-400" />
-          <span className="text-sm text-gray-600 dark:text-gray-300">Difficulty:</span>
-          <span className={`px-2 py-1 text-xs font-medium rounded-full ${getDifficultyBadgeColor(statistics.difficulty)}`}>
-            {statistics.difficulty}
+          <span className={`px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-700 dark:bg-yellow-900/20 dark:text-yellow-400 rounded-full`}>
+            {timeTaken}
           </span>
         </div>
       </div>

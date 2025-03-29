@@ -1,10 +1,10 @@
 import React, { useState } from 'react';
-import { MessageSquare } from 'lucide-react';
-import { Question } from '../../types/exam';
+import { MessageSquare, Book, Timer } from 'lucide-react';
+import { TestQuestion } from '../../types/exam';
 import QuestionFeedbackModal from '../modals/QuestionFeedbackModal';
 
 interface Props {
-  question: Question;
+  question: TestQuestion;
   isFullyCorrect: boolean;
   onScoringHelp: () => void;
   isStackedView?: boolean;
@@ -25,8 +25,90 @@ const ExplanationSection = ({ question, isFullyCorrect, onScoringHelp, isStacked
   // Check if this is a SATA question
   const isSATAQuestion = correctChoices.length > 1;
 
+  // Handle the explanation text
+  // Attempt to parse structured data or use the raw text
+  let correctExplanation = "No explanation available.";
+  let incorrectExplanation = "No explanation available.";
+  let references: string[] = [];
+  
+  if (question.explanation) {
+    try {
+      // First check if the explanation is a JSON string
+      const parsedExplanation = JSON.parse(question.explanation);
+      if (parsedExplanation.correct) {
+        correctExplanation = parsedExplanation.correct;
+      }
+      if (parsedExplanation.incorrect) {
+        incorrectExplanation = parsedExplanation.incorrect;
+      }
+      if (parsedExplanation.references) {
+        references = Array.isArray(parsedExplanation.references) 
+          ? parsedExplanation.references 
+          : [parsedExplanation.references];
+      }
+    } catch (e) {
+      // Not JSON, so handle as plain text
+      // For now we'll just show the full explanation for both sections
+      correctExplanation = question.explanation;
+      
+      // For incorrect choices, if we have no specific content, create a placeholder
+      if (incorrectChoices.length > 0) {
+        incorrectExplanation = question.explanation;
+      }
+    }
+  }
+  
+  // Handle references from the question object if not in the explanation
+  console.log("Question object:", question);
+  console.log("References from explanation parsing:", references);
+  console.log("Question has ref_sources property:", question.hasOwnProperty('ref_sources'));
+  
+  // Look for ref_sources - this is the field name in the database
+  if (references.length === 0 && question.ref_sources) {
+    console.log("Using ref_sources from question object:", question.ref_sources);
+    references = Array.isArray(question.ref_sources) 
+      ? question.ref_sources 
+      : typeof question.ref_sources === 'string' ? question.ref_sources.split('\n') : [];
+  }
+  // Also check for legacy references property for backward compatibility
+  else if (references.length === 0 && question.references) {
+    console.log("Using legacy references property:", question.references);
+    references = Array.isArray(question.references) 
+      ? question.references 
+      : typeof question.references === 'string' ? question.references.split('\n') : [];
+  }
+  
+  console.log("Final references array:", references);
+
+  // Handle multiple paragraphs in explanations
+  const formatExplanationText = (text: string | string[]): React.ReactNode => {
+    if (typeof text === 'string') {
+      return text.split('\n').map((paragraph: string, index: number) => (
+        <p key={index} className="text-gray-700 dark:text-gray-300 mb-2 explanation-text">
+          {paragraph}
+        </p>
+      ));
+    } else if (Array.isArray(text)) {
+      return text.map((paragraph: string, index: number) => (
+        <p key={index} className="text-gray-700 dark:text-gray-300 mb-2 explanation-text">
+          {paragraph}
+        </p>
+      ));
+    }
+    return <p className="text-gray-700 dark:text-gray-300 mb-2 explanation-text">{String(text)}</p>;
+  };
+  
+  // Create a statistics object with our available data
+  const statistics = {
+    clientNeedArea: question.topic || 'General',
+    clientNeedTopic: question.sub_topic || 'Unknown',
+    percentCorrect: 0,
+    difficulty: question.difficulty || 'Medium',
+    timeTaken: question.time_taken || '2:01'
+  };
+
   return (
-    <div className={`p-6 pb-24 mt-7 ${isStackedView ? 'md:px-[calc(12rem_+_1.5rem)]' : 'md:px-12'}`}>
+    <div className={`p-6 pb-24 mt-7 ${isStackedView ? 'md:px-[calc(12rem_+_1.5rem)]' : 'md:px-12'} bg-blue-50/20`}>
       <div className="flex justify-between items-center mb-6">
         <h3 className="text-4xl font-bold text-gray-800 dark:text-white">Explanation</h3>
         <button
@@ -38,23 +120,39 @@ const ExplanationSection = ({ question, isFullyCorrect, onScoringHelp, isStacked
         </button>
       </div>
       
-      <div className="space-y-4 mb-8">
+      <div className="space-y-6 mb-8">
+        {/* Correct Answer Explanation */}
         <div>
-          <h4 className="font-medium text-green-600 dark:text-green-400 mb-2">
+          <h4 className="font-medium text-green-600 dark:text-green-400 mb-3">
             {`Choice${correctChoices.length > 1 ? 's' : ''} ${correctChoices.join(', ')} ${correctChoices.length > 1 ? 'are' : 'is'} correct.`}
           </h4>
-          {question.explanation.correct.map((text, index) => (
-            <p key={index} className="text-gray-700 dark:text-gray-300 mb-2 explanation-text">{text}</p>
-          ))}
+          {formatExplanationText(correctExplanation)}
         </div>
-        <div>
-          <h4 className="font-medium text-red-600 dark:text-red-400 mb-2">
-            {`Choice${incorrectChoices.length > 1 ? 's' : ''} ${incorrectChoices.join(', ')} ${incorrectChoices.length > 1 ? 'are' : 'is'} incorrect.`}
-          </h4>
-          {question.explanation.incorrect.map((text, index) => (
-            <p key={index} className="text-gray-700 dark:text-gray-300 mb-2 explanation-text">{text}</p>
-          ))}
-        </div>
+
+        {/* Incorrect Answer Explanation - only show if there are incorrect choices */}
+        {incorrectChoices.length > 0 && (
+          <div>
+            <h4 className="font-medium text-red-600 dark:text-red-400 mb-3">
+              {`Choice${incorrectChoices.length > 1 ? 's' : ''} ${incorrectChoices.join(', ')} ${incorrectChoices.length > 1 ? 'are' : 'is'} incorrect.`}
+            </h4>
+            {formatExplanationText(incorrectExplanation)}
+          </div>
+        )}
+        
+        {/* References Section */}
+        {references.length > 0 && (
+          <div className="mt-6 p-4 bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700">
+            <h4 className="font-medium text-gray-800 dark:text-gray-200 mb-3 flex items-center">
+              <Book className="w-4 h-4 mr-2" />
+              References
+            </h4>
+            <ul className="list-disc list-inside space-y-1 text-sm text-gray-600 dark:text-gray-400">
+              {references.map((reference, index) => (
+                <li key={index} className="ml-2">{reference}</li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
 
       {/* Horizontal Separator */}
@@ -66,20 +164,20 @@ const ExplanationSection = ({ question, isFullyCorrect, onScoringHelp, isStacked
           <span className="px-2 py-1 text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 rounded-full whitespace-nowrap">
             Client Needs Topic
           </span>
-          <span className="text-gray-600 dark:text-gray-300 break-words">{question.statistics.clientNeedArea}</span>
+          <span className="text-gray-600 dark:text-gray-300 break-words">{statistics.clientNeedArea}</span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="px-2 py-1 text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 rounded-full whitespace-nowrap">
             Sub-topic
           </span>
-          <span className="text-gray-600 dark:text-gray-300 break-words">{question.statistics.clientNeedTopic}</span>
+          <span className="text-gray-600 dark:text-gray-300 break-words">{statistics.clientNeedTopic}</span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="px-2 py-1 text-xs font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300 rounded-full whitespace-nowrap">
             Question Format
           </span>
           <span className="text-gray-600 dark:text-gray-300 break-words">
-            SATA Question
+            {isSATAQuestion ? 'SATA Question' : 'Multiple Choice'}
             {isSATAQuestion && (
               <button
                 onClick={onScoringHelp}
@@ -90,12 +188,20 @@ const ExplanationSection = ({ question, isFullyCorrect, onScoringHelp, isStacked
             )}
           </span>
         </div>
+        {question.ngn && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="px-2 py-1 text-xs font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 rounded-full whitespace-nowrap">
+              Question Type
+            </span>
+            <span className="text-gray-600 dark:text-gray-300">Next Generation NCLEX (NGN)</span>
+          </div>
+        )}
       </div>
 
       <QuestionFeedbackModal
         isOpen={showFeedbackModal}
         onClose={() => setShowFeedbackModal(false)}
-        questionId={question.qid}
+        questionId={question.id.toString()}
         testId={`T${question.id}`}
       />
     </div>

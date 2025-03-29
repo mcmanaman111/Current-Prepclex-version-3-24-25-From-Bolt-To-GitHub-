@@ -1,5 +1,40 @@
 # Changelog
 
+## [2024-03-28 18:25] Question References and Timing Improvements
+
+### Type
+- Fixed
+- Enhanced
+
+### Files
+- /src/services/api.ts
+- /src/services/mockData.ts
+- /src/components/exam/ExplanationSection.tsx
+- /src/types/exam.ts
+- /src/pages/ExamPage.tsx
+- /src/components/exam/QuestionSection.tsx
+
+### Changes
+- Fixed references display by correctly accessing ref_sources column instead of references
+- Enhanced question timer implementation to record actual time spent per question
+- Added comprehensive timing analytics during test sessions
+- Updated interfaces to properly type the new data structures
+- Enhanced score display to show accurate timing information
+
+### Dependencies
+- No new dependencies added
+
+### Database
+- No schema changes, but corrected field access for existing columns
+- Better utilization of ref_sources column for reference display
+
+### Notes
+- References now properly display in the explanation section
+- Question timing is now accurately recorded and displayed, replacing mock data
+- Added comprehensive analytics that track time spent on individual questions
+- Enhanced test completion data to include timing metrics for future analysis
+- Time is displayed in MM:SS format with proper zero-padding
+
 ## [2024-03-24 06:15] Question Format and Upload Enhancements
 
 ### Type

@@ -6,10 +6,10 @@ import ExamNotesModal from '../modals/ExamNotesModal';
 import StudyResourcesModal from './StudyResourcesModal';
 import { useTheme } from '../../hooks/useTheme';
 import Tooltip from '../ui/Tooltip';
-import type { Question } from '../../types/exam';
+import { TestQuestion } from '../../types/exam';
 
 interface Props {
-  testId: number;
+  testId: number | string;
   isMarked: boolean;
   onMarkForReview: () => void;
   testSettings: {
@@ -24,7 +24,7 @@ interface Props {
   setShowSettings: (show: boolean) => void;
   isStackedView: boolean;
   onViewToggle: () => void;
-  currentQuestion: Question;
+  currentQuestion: TestQuestion | null;
 }
 
 const ExamSubHeader = ({ 
@@ -186,10 +186,10 @@ const ExamSubHeader = ({
       <ExamNotesModal 
         isOpen={showNotesModal}
         onClose={() => setShowNotesModal(false)}
-        questionId={currentQuestion.qid}
-        testId={`T${testId}`}
-        topic={currentQuestion.statistics.clientNeedArea}
-        subTopic={currentQuestion.statistics.clientNeedTopic}
+        questionId={currentQuestion?.id?.toString() || '0'}
+        testId={testId.toString()}
+        topic={currentQuestion?.topic || 'Unknown'}
+        subTopic={currentQuestion?.sub_topic || 'Unknown'}
       />
 
       <ExamSettings 
