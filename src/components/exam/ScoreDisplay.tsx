@@ -36,17 +36,23 @@ const ScoreDisplay = ({
   const formattedTestId = `TID: T${testNumber.toString().padStart(2, '0')}-${userId}-${cumulativeTestNumber}`;
   const combinedId = `${formattedQuestionId} | ${formattedTestId}`;
 
-  if (score.isFullyCorrect) {
-    icon = <CheckCircle2 className="w-6 h-6" />;
-    message = "You are correct. Nice work!";
-    bgColor = "bg-green-100 dark:bg-green-900/20";
-    textColor = "text-green-700 dark:text-green-400";
-  } else if (score.correct > 0 && score.correct < score.total) {
-    icon = <AlertCircle className="w-6 h-6" />;
-    message = "Partially correct. Review the explanation provided.";
-    bgColor = "bg-blue-100 dark:bg-blue-900/20";
-    textColor = "text-blue-700 dark:text-blue-400";
+  // If any correct answer was selected, show positive feedback
+  if (score.correct > 0) {
+    if (score.isFullyCorrect) {
+      // All correct answers selected with no incorrect ones
+      icon = <CheckCircle2 className="w-6 h-6" />;
+      message = "You are correct. Nice work!";
+      bgColor = "bg-green-100 dark:bg-green-900/20";
+      textColor = "text-green-700 dark:text-green-400";
+    } else {
+      // Some correct answers but either missing some or has some incorrect ones
+      icon = <AlertCircle className="w-6 h-6" />;
+      message = "Partially correct. Review the explanation provided.";
+      bgColor = "bg-blue-100 dark:bg-blue-900/20"; 
+      textColor = "text-blue-700 dark:text-blue-400";
+    }
   } else {
+    // No correct answers selected
     icon = <XCircle className="w-6 h-6" />;
     message = "Incorrect. Review the explanation provided.";
     bgColor = "bg-red-100 dark:bg-red-900/20";

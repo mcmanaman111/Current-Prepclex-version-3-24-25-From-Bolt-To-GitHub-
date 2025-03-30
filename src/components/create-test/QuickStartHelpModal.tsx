@@ -20,7 +20,7 @@ const QuickStartHelpModal = ({ isOpen, onClose }: QuickStartHelpModalProps) => {
       title: 'Customizable Settings',
       description: 'Customize your test settings:',
       subFeatures: [
-        'Choose the number of questions (1-75)',
+        'Choose the number of questions (1-85)',
         'Enable or disable timed mode',
         'Include or exclude NGN questions',
         'Save your preferences for future quick starts'

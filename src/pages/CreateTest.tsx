@@ -66,10 +66,81 @@ const CreateTest = () => {
     }
   }, [user]);
 
-  // Fetch data when component mounts
-  useEffect(() => {
+  // Aggressive scroll to top using multiple approaches and timings
+  const scrollToTop = useCallback(() => {
+    console.log("Executing scroll to top");
+    // Immediate scroll
     window.scrollTo(0, 0);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
     
+    // Using requestAnimationFrame for next paint frame
+    requestAnimationFrame(() => {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    });
+    
+    // Multiple delayed scrolls as fallbacks
+    setTimeout(() => {
+      window.scrollTo({
+        top: 0,
+        left: 0,
+        behavior: 'instant'
+      });
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 0);
+    
+    setTimeout(() => {
+      window.scrollTo({
+        top: 0,
+        left: 0,
+        behavior: 'auto'
+      });
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 50);
+    
+    setTimeout(() => {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 100);
+    
+    setTimeout(() => {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 500);
+  }, []);
+  
+  // Apply scroll fix on initial mount
+  useEffect(() => {
+    scrollToTop();
+    
+    // This prevents the scroll position from being affected by history navigation
+    if ('scrollRestoration' in history) {
+      history.scrollRestoration = 'manual';
+    }
+    
+    return () => {
+      // Reset scroll restoration to auto when component unmounts
+      if ('scrollRestoration' in history) {
+        history.scrollRestoration = 'auto';
+      }
+    };
+  }, [scrollToTop]);
+  
+  // Apply scroll fix when loading changes (before → after)
+  useEffect(() => {
+    if (!loading) {
+      scrollToTop();
+    }
+  }, [loading, scrollToTop]);
+  
+  // Fetch data when component mounts or user changes
+  useEffect(() => {
     const loadData = async () => {
       setLoading(true);
       try {
@@ -96,17 +167,29 @@ const CreateTest = () => {
     loadData();
   }, [user]);
 
-  // Memoize the quick start handler
-  const handleQuickStart = useCallback(() => {
+  // Memoize the quick start handler - now accepting pre-fetched questions
+  const handleQuickStart = useCallback((settings: {
+    tutorMode: boolean;
+    timer: boolean;
+    ngn: boolean;
+    questionCount: number;
+    isQuickStart: boolean;
+    questions?: any[];
+    minutesPerQuestion?: number;
+  }) => {
+    // If questions are provided, pass them directly to the exam page
+    // Otherwise, use the existing flow which will load mock questions
     navigate('/exam', { 
       state: { 
         isQuickStart: true,
         settings: {
-          tutorMode: true,
-          timer: false,
-          ngn: false,
-          questionCount: 25
-        }
+          tutorMode: settings.tutorMode || true, // Always true for Quick Start
+          timer: settings.timer || false,
+          ngn: settings.ngn || false,
+          questionCount: settings.questionCount || 25,
+          minutesPerQuestion: settings.minutesPerQuestion || 2
+        },
+        questions: settings.questions // Pass the pre-fetched questions if available
       } 
     });
   }, [navigate]);
@@ -401,11 +484,15 @@ const CreateTest = () => {
         </div>
       )}
 
-      <QuickStartModal
-        isOpen={showQuickStartModal}
-        onClose={() => setShowQuickStartModal(false)}
-        onStart={handleQuickStart}
-      />
+      {/* Add a key to force re-render when modal is opened */}
+      {showQuickStartModal && (
+        <QuickStartModal
+          key={`quick-start-modal-${Date.now()}`}
+          isOpen={showQuickStartModal}
+          onClose={() => setShowQuickStartModal(false)}
+          onStart={handleQuickStart}
+        />
+      )}
     </div>
   );
 };

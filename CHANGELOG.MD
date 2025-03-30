@@ -1,5 +1,40 @@
 # Changelog
 
+## [2025-03-30 00:22] Quick Start Feature and Page Scrolling Fixes
+
+### Type
+- Fixed
+- Enhanced
+
+### Files
+- /src/utils/examUtils.ts
+- /src/services/api.ts
+- /src/pages/CreateTest.tsx
+- /src/pages/Home.tsx
+
+### Changes
+- Enhanced question shuffling algorithm with multiple passes and timestamp-based entropy
+- Added safeguards to prevent identical question sequences
+- Fixed scrolling issues on CreateTest and Home pages
+- Implemented aggressive multi-stage scrolling solution with multiple timing intervals
+- Added history.scrollRestoration handling to prevent browser-managed scroll positions
+- Fixed Quick Start to use actual Supabase database instead of mock data
+- Added detailed logging for question selection and randomization
+- Improved scroll behavior when data is loading
+
+### Dependencies
+- No new dependencies added
+
+### Database
+- No schema changes
+- Better utilization of existing tables (questions, answers)
+
+### Notes
+- Quick Start now properly randomizes questions from the Supabase database
+- Pages now consistently scroll to top regardless of data loading status
+- Implemented multiple scroll techniques (immediate, RAF, timeouts) for maximum compatibility
+- Enhanced randomization includes timestamp entropy, multiple passes, and section reversals
+
 ## [2024-03-28 18:25] Question References and Timing Improvements
 
 ### Type

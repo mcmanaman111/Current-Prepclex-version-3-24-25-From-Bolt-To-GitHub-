@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Check, X } from 'lucide-react';
 import ScoreDisplay from './ScoreDisplay';
 import { TestQuestion, Score } from '../../types/exam';
@@ -15,6 +15,7 @@ interface Props {
   isStackedView?: boolean;
   isSplitView?: boolean;
   actualTimeTaken?: number;
+  tutorMode?: boolean; // Add tutorMode prop
 }
 
 const QuestionSection = ({ 
@@ -28,10 +29,12 @@ const QuestionSection = ({
   cumulativeTestNumber = 1212,
   isStackedView = true,
   isSplitView = false,
-  actualTimeTaken = 0
+  actualTimeTaken = 0,
+  tutorMode = true // Default to true for backwards compatibility
 }: Props) => {
   const renderAnswerIndicator = (index: number) => {
-    if (!isSubmitted) return null;
+    // Only show answer indicators if submitted AND tutor mode is on
+    if (!isSubmitted || !tutorMode) return null;
 
     const isCorrect = question.choices[index].isCorrect;
     return isCorrect ? (
@@ -43,6 +46,15 @@ const QuestionSection = ({
 
   // Use stacked view padding unless in split view mode with submitted answer
   const shouldUseStackedPadding = !isSplitView || !isSubmitted;
+
+  // Determine if this is a SATA (Select All That Apply) question
+  // Count how many correct answers the question has
+  const correctAnswerCount = useMemo(() => {
+    return (question.choices || []).filter(choice => choice.isCorrect).length;
+  }, [question.choices]);
+  
+  // Question is SATA if it has more than one correct answer
+  const isSATAQuestion = correctAnswerCount > 1;
 
   // Handle mapping between our TestQuestion type and the expected data structure
   const questionText = question.question_text || '';
@@ -74,7 +86,7 @@ const QuestionSection = ({
           <p className="text-lg text-gray-800 dark:text-gray-200 question-text">{questionText}</p>
         </div>
 
-        <div className="space-y-3 mb-12">
+        <div className="space-y-3 mb-4">
           {choices.map((choice, index) => (
             <div
               key={index}
@@ -91,17 +103,30 @@ const QuestionSection = ({
                   onAnswerSelect(index);
                 }}
               >
-                <input
-                  type="checkbox"
-                  checked={selectedAnswers.includes(index)}
-                  onChange={() => onAnswerSelect(index)}
-                  className="mt-1 cursor-pointer"
-                  onClick={(e) => e.stopPropagation()}
-                />
+                {isSATAQuestion ? (
+                  // Checkboxes for questions with multiple correct answers (SATA)
+                  <input
+                    type="checkbox"
+                    checked={selectedAnswers.includes(index)}
+                    onChange={() => onAnswerSelect(index)}
+                    className="mt-1 cursor-pointer"
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                ) : (
+                  // Radio buttons for multiple choice questions with one correct answer
+                  <input
+                    type="radio"
+                    checked={selectedAnswers.includes(index)}
+                    onChange={() => onAnswerSelect(index)}
+                    className="mt-1 cursor-pointer"
+                    onClick={(e) => e.stopPropagation()}
+                    name="single-choice-answer"
+                  />
+                )}
                 <div className="flex items-start gap-2">
                   <span className="font-medium text-gray-700 dark:text-gray-300">{index + 1}.</span>
                   <span className={`text-gray-800 dark:text-gray-200 choice-text ${
-                    isSubmitted && choice.isCorrect ? 'text-green-700 dark:text-green-400' : ''
+                    isSubmitted && tutorMode && choice.isCorrect ? 'text-green-700 dark:text-green-400' : ''
                   }`}>
                     {choice.text}
                   </span>
@@ -111,7 +136,13 @@ const QuestionSection = ({
           ))}
         </div>
 
-        {isSubmitted && score && (
+        {/* Horizontal Separator - only show in tutor mode */}
+        {isSubmitted && score && tutorMode && (
+          <hr className="border-t border-gray-200 dark:border-gray-700 mb-4" />
+        )}
+
+        {/* Score display - only show in tutor mode */}
+        {isSubmitted && score && tutorMode && (
           <ScoreDisplay 
             score={score} 
             statistics={statistics} 

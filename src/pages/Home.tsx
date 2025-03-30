@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { CheckCircle2, BarChart2, ClipboardList, Flame } from 'lucide-react';
 import WelcomeSection from '../components/home/WelcomeSection';
@@ -13,6 +13,72 @@ const Home = () => {
   const navigate = useNavigate();
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showQuickStartModal, setShowQuickStartModal] = useState(false);
+  
+  // Aggressive scroll to top using multiple approaches and timings
+  const scrollToTop = useCallback(() => {
+    console.log("Home: Executing scroll to top");
+    // Immediate scroll
+    window.scrollTo(0, 0);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+    
+    // Using requestAnimationFrame for next paint frame
+    requestAnimationFrame(() => {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    });
+    
+    // Multiple delayed scrolls as fallbacks
+    setTimeout(() => {
+      window.scrollTo({
+        top: 0,
+        left: 0,
+        behavior: 'instant'
+      });
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 0);
+    
+    setTimeout(() => {
+      window.scrollTo({
+        top: 0,
+        left: 0,
+        behavior: 'auto'
+      });
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 50);
+    
+    setTimeout(() => {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 100);
+    
+    setTimeout(() => {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }, 500);
+  }, []);
+  
+  // Apply scroll fix on initial mount
+  useEffect(() => {
+    scrollToTop();
+    
+    // This prevents the scroll position from being affected by history navigation
+    if ('scrollRestoration' in history) {
+      history.scrollRestoration = 'manual';
+    }
+    
+    return () => {
+      // Reset scroll restoration to auto when component unmounts
+      if ('scrollRestoration' in history) {
+        history.scrollRestoration = 'auto';
+      }
+    };
+  }, [scrollToTop]);
 
   const handleTestComplete = (config: TestConfig) => {
     setShowCreateModal(false);
@@ -25,9 +91,23 @@ const Home = () => {
     ngn: boolean;
     questionCount: number;
     isQuickStart: boolean;
+    questions?: any[]; // Add questions property
+    minutesPerQuestion?: number; // Add minutesPerQuestion property
   }) => {
     setShowQuickStartModal(false);
-    navigate('/exam', { state: { settings } });
+    navigate('/exam', { 
+      state: { 
+        isQuickStart: true,
+        settings: {
+          tutorMode: settings.tutorMode || true, // Always true for Quick Start
+          timer: settings.timer || false,
+          ngn: settings.ngn || false,
+          questionCount: settings.questionCount || 25,
+          minutesPerQuestion: settings.minutesPerQuestion || 2
+        },
+        questions: settings.questions // Pass the pre-fetched questions if available
+      } 
+    });
   };
 
   // Function to view test results with mock data
@@ -131,11 +211,15 @@ const Home = () => {
           onComplete={handleTestComplete}
         />
 
-        <QuickStartModal
-          isOpen={showQuickStartModal}
-          onClose={() => setShowQuickStartModal(false)}
-          onStart={handleQuickStart}
-        />
+        {/* Add a key to force re-render when modal is opened */}
+        {showQuickStartModal && (
+          <QuickStartModal
+            key={`quick-start-modal-${Date.now()}`}
+            isOpen={showQuickStartModal}
+            onClose={() => setShowQuickStartModal(false)}
+            onStart={handleQuickStart}
+          />
+        )}
       </div>
     </div>
   );

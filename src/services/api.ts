@@ -469,6 +469,249 @@ export const fetchQuestionTypeData = async (userId: string): Promise<{
 /**
  * Fetches the total count of NGN questions and their distribution by topic
  */
+/**
+ * Fetches unused questions specifically for Quick Start functionality
+ * This function retrieves questions the user hasn't seen before,
+ * applying NGN filters if specified, and returns randomly selected questions
+ * with their corresponding answers
+ */
+export const fetchUnusedQuestionsForQuickStart = async (
+  userId: string,
+  questionCount: number,
+  includeNGN: boolean,
+  minutesPerQuestion: number = 2
+): Promise<QuestionWithChoices[]> => {
+  if (USE_MOCK_DATA) {
+    // For mock data, simulate filtering for unused questions
+    // Most mock questions don't have the ngn property, so treat them as non-NGN by default
+    const filteredQuestions = mockQuestions.map((q, index) => ({
+      ...q,
+      // Add ngn property explicitly if missing (every 5th question is NGN for testing)
+      ngn: q.ngn !== undefined ? q.ngn : index % 5 === 0,
+      // Add topic_id if missing
+      topic_id: q.topic_id || Math.floor(index / 5) + 1,
+      // Add sub_topic_id if missing
+      sub_topic_id: q.sub_topic_id || (index % 5) + 1
+    })).filter(q => {
+      // Filter based on NGN setting
+      if (!includeNGN && q.ngn) return false;
+      return true;
+    });
+    
+    console.log(`Found ${filteredQuestions.length} questions matching criteria (includeNGN=${includeNGN})`);
+    
+    // Ensure we're getting the full requested count (or max available)
+    const actualCount = Math.min(questionCount, filteredQuestions.length);
+    console.log(`User requested ${questionCount} questions, selecting ${actualCount}`);
+    
+    // Shuffle with 3 passes for better randomization
+    console.log("Quick Start with mock data - pre-shuffle IDs:", filteredQuestions.map(q => q.id).join(', '));
+    const shuffledQuestions = shuffleArray([...filteredQuestions], 3);
+    console.log("Quick Start with mock data - post-shuffle IDs:", shuffledQuestions.map(q => q.id).join(', '));
+    
+    // Take the requested number of questions
+    const selectedQuestions = shuffledQuestions.slice(0, actualCount);
+    console.log("Quick Start final selection - count:", selectedQuestions.length);
+    console.log("Quick Start final selection IDs:", selectedQuestions.map(q => q.id).join(', '));
+    
+    return selectedQuestions;
+  }
+  
+  try {
+    console.log('Fetching unused questions for Quick Start with params:', {
+      userId,
+      questionCount,
+      includeNGN
+    });
+    
+    // 1. Get question IDs that the user has already answered or interacted with
+    const { data: usedQuestionsData, error: usedError } = await supabase
+      .from('question_status')
+      .select('question_id')
+      .eq('user_id', userId);
+    
+    if (usedError) throw usedError;
+    
+    // Create a set of used question IDs for fast lookup
+    const usedQuestionIds = new Set(usedQuestionsData?.map(item => item.question_id) || []);
+    
+    // 2. Base query for all questions
+    let query = supabase.from('questions').select('*');
+    
+    // 3. Apply NGN filter if needed
+    if (!includeNGN) {
+      query = query.eq('ngn', false);
+    }
+    
+    // 4. Execute the query to get all potential questions
+    const { data: allQuestionsData, error: questionsError } = await query;
+    
+    if (questionsError) throw questionsError;
+    
+    if (!allQuestionsData || allQuestionsData.length === 0) {
+      console.warn('No questions found that match the criteria');
+      return [];
+    }
+    
+    // 5. Filter out questions that the user has already used
+    const unusedQuestions = allQuestionsData.filter(q => !usedQuestionIds.has(q.id));
+    
+    console.log(`Found ${unusedQuestions.length} unused questions out of ${allQuestionsData.length} total`);
+    
+    if (unusedQuestions.length === 0) {
+      console.warn('No unused questions available for this user');
+      return [];
+    }
+    
+    // 6. Shuffle and select the requested number of questions
+    // Apply improved shuffling with multiple passes
+    console.log("Unused questions before shuffle:", unusedQuestions.map(q => q.id).join(', '));
+    
+    // Use the enhanced shuffling with 3 passes
+    const shuffledQuestions = shuffleArray([...unusedQuestions], 3);
+    console.log("Unused questions after shuffle:", shuffledQuestions.map(q => q.id).join(', '));
+    
+    // Select the requested number of questions
+    const selectedQuestions = shuffledQuestions
+      .slice(0, Math.min(questionCount, unusedQuestions.length));
+    
+    console.log("Final selected questions for Quick Start:", selectedQuestions.map(q => q.id).join(', '));
+    
+    // 7. Get question IDs to fetch their answers
+    const questionIds = selectedQuestions.map(q => q.id);
+    
+    // 8. Fetch answers for the selected questions
+    const { data: answersData, error: answersError } = await supabase
+      .from('answers')
+      .select('*')
+      .in('question_id', questionIds);
+    
+    if (answersError) throw answersError;
+    
+    console.log(`Fetched ${answersData?.length || 0} answers for ${questionIds.length} questions`);
+    
+    // 9. Group answers by question_id
+    const answersByQuestionId = (answersData || []).reduce((acc, answer) => {
+      if (!acc[answer.question_id]) {
+        acc[answer.question_id] = [];
+      }
+      acc[answer.question_id].push(answer);
+      return acc;
+    }, {} as Record<number, any[]>);
+    
+    // 10. Combine questions with their answers
+    const questionsWithChoices = selectedQuestions.map(question => {
+      const questionAnswers = answersByQuestionId[question.id] || [];
+      
+      // Sort answers by option_number if available
+      const sortedAnswers = [...questionAnswers].sort((a, b) => 
+        (a.option_number || 0) - (b.option_number || 0)
+      );
+      
+      // Format answers as choices
+      const choices = sortedAnswers.map(answer => ({
+        text: answer.answer_text || '',
+        isCorrect: answer.is_correct || false
+      }));
+      
+      // Process explanation field
+      let explanation = question.explanation || "No explanation available";
+      
+      // Get references from the ref_sources column
+      const hasRefSources = question.hasOwnProperty('ref_sources') && question.ref_sources;
+      
+      // Process references
+      let references = [];
+      if (hasRefSources) {
+        if (Array.isArray(question.ref_sources)) {
+          references = question.ref_sources;
+        } else if (typeof question.ref_sources === 'string') {
+          references = question.ref_sources.includes('\n') 
+            ? question.ref_sources.split('\n') 
+            : [question.ref_sources];
+        }
+      }
+      
+      // Set default time or use provided value
+      let time_taken = question.time_taken || `${minutesPerQuestion}:00`;
+      
+      return {
+        ...question,
+        choices: choices.length > 0 ? choices : [
+          { text: "No answer options available", isCorrect: true },
+          { text: "Please report this issue", isCorrect: false }
+        ],
+        explanation: explanation,
+        references: references,
+        time_taken: time_taken
+      };
+    });
+    
+    return questionsWithChoices;
+  } catch (error) {
+    console.error('Error fetching unused questions for QuickStart:', error);
+    
+    // Fall back to mock implementation
+    const filteredQuestions = mockQuestions.filter(q => {
+      if (!includeNGN && q.ngn) return false;
+      return true;
+    });
+    
+    const shuffledQuestions = shuffleArray([...filteredQuestions]);
+    return shuffledQuestions.slice(0, Math.min(questionCount, shuffledQuestions.length));
+  }
+};
+
+/**
+ * Gets the count of unused questions available for the current user
+ */
+export const getUnusedQuestionsCount = async (
+  userId: string,
+  includeNGN: boolean
+): Promise<number> => {
+  if (USE_MOCK_DATA) {
+    return includeNGN ? 19 : 13; // Mock data has 19 total, 13 non-NGN questions
+  }
+  
+  try {
+    // 1. Get question IDs that the user has already answered or interacted with
+    const { data: usedQuestionsData, error: usedError } = await supabase
+      .from('question_status')
+      .select('question_id')
+      .eq('user_id', userId);
+    
+    if (usedError) throw usedError;
+    
+    // Create a set of used question IDs for fast lookup
+    const usedQuestionIds = new Set(usedQuestionsData?.map(item => item.question_id) || []);
+    
+    // 2. Base query for all questions
+    let query = supabase.from('questions').select('id, ngn');
+    
+    // 3. Apply NGN filter if needed
+    if (!includeNGN) {
+      query = query.eq('ngn', false);
+    }
+    
+    // 4. Execute the query to get all potential questions
+    const { data: allQuestionsData, error: questionsError } = await query;
+    
+    if (questionsError) throw questionsError;
+    
+    if (!allQuestionsData || allQuestionsData.length === 0) {
+      return 0;
+    }
+    
+    // 5. Count questions that the user has not used
+    const unusedCount = allQuestionsData.filter(q => !usedQuestionIds.has(q.id)).length;
+    
+    return unusedCount;
+  } catch (error) {
+    console.error('Error getting unused questions count:', error);
+    return includeNGN ? 19 : 13; // Fallback to mock counts
+  }
+};
+
 export const fetchNgnQuestionsData = async (): Promise<{
   total: number,
   byTopic: Record<string, number>

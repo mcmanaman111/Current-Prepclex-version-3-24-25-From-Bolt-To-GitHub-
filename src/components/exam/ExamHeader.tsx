@@ -61,7 +61,7 @@ const ExamHeader = ({
 
             {/* Center section with PREPCLEX text */}
             <div className="flex-1 flex flex-col items-center text-center">
-              <h1 className="text-2xl font-bold">PREPCLEX®</h1>
+              <h1 className="text-2xl font-bold">PrepClex®</h1>
               <span className="text-sm mt-1 w-full text-center hidden lg:block">NCLEX® Exam Preparation</span>
             </div>
 

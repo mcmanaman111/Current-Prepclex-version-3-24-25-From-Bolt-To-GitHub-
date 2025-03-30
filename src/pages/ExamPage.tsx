@@ -9,6 +9,7 @@ import StopTestDialog from '../components/exam/StopTestDialog';
 import NclexScoringModal from '../components/modals/NclexScoringModal';
 import TimerExpiredDialog from '../components/modals/TimerExpiredDialog';
 import SkipConfirmationDialog from '../components/modals/SkipConfirmationDialog';
+import TestCompletedModal from '../components/modals/TestCompletedModal';
 import { useExamTimer } from '../hooks/useExamTimer';
 import { mockQuestions } from '../data/mockData';
 import { fetchQuestionsForTest } from '../services/api';
@@ -81,6 +82,7 @@ const ExamPage = () => {
   const [showTimerExpired, setShowTimerExpired] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [isStackedView, setIsStackedView] = useState(() => window.innerWidth <= 768);
+  const [showTestCompleted, setShowTestCompleted] = useState(false);
 
   // Fetch questions based on selection criteria
   useEffect(() => {
@@ -91,9 +93,18 @@ const ExamPage = () => {
       return;
     }
     
-    // For quick start, just use mock questions
+    // For quick start, check if we have pre-fetched questions
     if (testSettings.isQuickStart) {
-      setQuestions(mockQuestions);
+      // If questions are provided in the state (from our updated QuickStart flow),
+      // use those questions instead of mock data
+      if (location.state?.questions && location.state.questions.length > 0) {
+        console.log("Using pre-fetched questions from Quick Start:", location.state.questions.length);
+        setQuestions(location.state.questions);
+      } else {
+        // Fall back to mock questions if no questions provided (backward compatibility)
+        console.log("No pre-fetched questions found for Quick Start, using mock data");
+        setQuestions(mockQuestions);
+      }
       setIsLoading(false);
       return;
     }
@@ -178,10 +189,22 @@ const ExamPage = () => {
 
   const handleAnswerSelect = (index: number) => {
     if (!currentQuestion || currentQuestionState.isSubmitted) return;
+
+    // Count how many correct answers the question has to determine if it's multiple choice or SATA
+    const correctAnswerCount = currentQuestion.choices.filter((choice: { isCorrect: boolean }) => choice.isCorrect).length;
+    const isMultipleChoice = correctAnswerCount === 1;
     
-    const newSelectedAnswers = currentQuestionState.selectedAnswers.includes(index)
-      ? currentQuestionState.selectedAnswers.filter(i => i !== index)
-      : [...currentQuestionState.selectedAnswers, index];
+    let newSelectedAnswers;
+    
+    // For multiple choice questions (radio buttons), replace the selection
+    if (isMultipleChoice) {
+      newSelectedAnswers = [index]; // Always just select the one clicked
+    } else {
+      // For SATA questions (checkboxes), toggle the selection
+      newSelectedAnswers = currentQuestionState.selectedAnswers.includes(index)
+        ? currentQuestionState.selectedAnswers.filter(i => i !== index)
+        : [...currentQuestionState.selectedAnswers, index];
+    }
 
     setAnswerStates((prev: AnswerState) => ({
       ...prev,
@@ -230,6 +253,33 @@ const ExamPage = () => {
       
       // Update the time_taken property on the current question
       currentQuestion.time_taken = formattedTime;
+    }
+    
+    // Check if this is the last question in the test and it's now answered
+    const isLastQuestionAnswered = currentQuestionIndex === questions.length - 1;
+    const nowAllQuestionsAnswered = questions.every(q => 
+      q.id === currentQuestion.id || answerStates[q.id]?.isSubmitted
+    );
+    
+    // If this is the last question and all questions are now answered, show the test completed modal
+    if (isLastQuestionAnswered && nowAllQuestionsAnswered) {
+      // Wait a moment if in tutor mode to allow the user to see the explanation
+      if (testSettings.tutorMode) {
+        // Don't immediately show the modal, give user time to read explanation
+        return;
+      } else {
+        // In non-tutor mode, show the modal after a brief delay
+        setTimeout(() => {
+          setShowTestCompleted(true);
+        }, 500);
+      }
+    } 
+    // If tutor mode is off, automatically advance to the next question
+    else if (!testSettings.tutorMode && currentQuestionIndex < questions.length - 1) {
+      // Use setTimeout to give a brief moment for the answer to register
+      setTimeout(() => {
+        handleNext();
+      }, 500);
     }
   };
 
@@ -312,7 +362,20 @@ const ExamPage = () => {
     setIsStackedView(!isStackedView);
   };
 
+  // This function is called from the footer's "Complete Test" button in tutor mode
   const handleCompleteTest = () => {
+    if (testSettings.tutorMode) {
+      // In tutor mode, show the completion modal first
+      setShowTestCompleted(true);
+      return;
+    }
+    
+    // Otherwise navigate directly to results (this is called from the modal's "View Results" button)
+    navigateToResults();
+  };
+  
+  // This function handles the actual navigation to results page with all the data
+  const navigateToResults = () => {
     // Make sure to record the time for the current question before completing
     recordQuestionTime();
     
@@ -416,8 +479,8 @@ const ExamPage = () => {
                 currentQuestion={currentQuestion}
               />
 
-              <div className={`flex-1 flex ${!isStackedView && currentQuestionState.isSubmitted && !window.matchMedia('(max-width: 768px)').matches ? 'lg:flex-row' : 'flex-col'}`}>
-                <div className={`${!isStackedView && currentQuestionState.isSubmitted && !window.matchMedia('(max-width: 768px)').matches ? 'lg:w-1/2' : 'w-full'} bg-white dark:bg-dark`}>
+              <div className={`flex-1 flex ${!isStackedView && currentQuestionState.isSubmitted && testSettings.tutorMode && !window.matchMedia('(max-width: 768px)').matches ? 'lg:flex-row' : 'flex-col'}`}>
+                <div className={`${!isStackedView && currentQuestionState.isSubmitted && testSettings.tutorMode && !window.matchMedia('(max-width: 768px)').matches ? 'lg:w-1/2' : 'w-full'} bg-white dark:bg-dark`}>
                   <QuestionSection 
                     question={currentQuestion}
                     selectedAnswers={currentQuestionState.selectedAnswers}
@@ -425,12 +488,14 @@ const ExamPage = () => {
                     onAnswerSelect={handleAnswerSelect}
                     score={currentQuestionState.score}
                     isStackedView={isStackedView}
-                    isSplitView={!isStackedView && !window.matchMedia('(max-width: 768px)').matches}
+                    isSplitView={!isStackedView && testSettings.tutorMode && !window.matchMedia('(max-width: 768px)').matches}
                     actualTimeTaken={getQuestionTime(currentQuestionIndex)}
+                    tutorMode={testSettings.tutorMode}
                   />
                 </div>
 
-                {currentQuestionState.isSubmitted && (
+                {/* Only show explanation section if tutor mode is on */}
+                {currentQuestionState.isSubmitted && testSettings.tutorMode && (
                   <div className={`${!isStackedView && !window.matchMedia('(max-width: 768px)').matches ? 'hidden lg:block lg:w-1/2 lg:border-l border-gray-200 dark:border-gray-700' : ''} bg-gradient-to-b from-blue-50 via-blue-50/50 to-white dark:from-gray-900 dark:via-gray-900/95 dark:to-gray-900`}>
                     <ExplanationSection 
                       question={currentQuestion}
@@ -482,6 +547,14 @@ const ExamPage = () => {
             isOpen={showSkipDialog}
             onClose={() => setShowSkipDialog(false)}
             onConfirmSkip={handleConfirmSkip}
+          />
+          
+          <TestCompletedModal
+            isOpen={showTestCompleted}
+            onClose={() => setShowTestCompleted(false)}
+            onViewResults={navigateToResults}
+            questionsAnswered={Object.keys(answerStates).length}
+            totalQuestions={questions.length}
           />
         </>
       )}
